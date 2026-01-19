@@ -59,7 +59,7 @@ class AddFingerprintFeaturesStep(FeaturePreprocessingTransformerStep):
             # Keep the first hash even if there are collisions
             salted_X = X_det + self.rnd_salt_
             for i, row in enumerate(salted_X):
-                h = _float_hash_arr(row + self.rnd_salt_)
+                h = _float_hash_arr(row)
                 X_h[i] = h
         else:
             # Handle hash collisions by counting up and rehashing

@@ -21,11 +21,13 @@ from tabpfn.preprocessing.ensemble import _get_subsample_indices_for_estimators
 from tabpfn.preprocessing.pipeline_interfaces import FeaturePreprocessingTransformerStep
 from tabpfn.preprocessing.steps import (
     AdaptiveQuantileTransformer,
+    AddFingerprintFeaturesStep,
     DifferentiableZNormStep,
     KDITransformerWithNaN,
     ReshapeFeatureDistributionsStep,
     SafePowerTransformer,
 )
+from tabpfn.preprocessing.steps.reshape_feature_distribution_step import _skew
 from tabpfn.preprocessing.steps.preprocessing_helpers import (
     OrderPreservingColumnTransformer,
 )
@@ -169,7 +171,11 @@ def test_diff_znorm_transform_shape_mismatch(sample_data, categorical_features_l
 def test_diff_znorm_transform_with_zero_std(
     data_with_zero_std, categorical_features_list
 ):
-    """Test transform behavior with zero std deviation column."""
+    """Test transform behavior with zero std deviation column.
+
+    With the epsilon fix, constant columns should now produce finite values
+    (close to 0) instead of NaN.
+    """
     step = DifferentiableZNormStep()
     step._fit(data_with_zero_std, categorical_features_list)
 
@@ -177,10 +183,15 @@ def test_diff_znorm_transform_with_zero_std(
 
     transformed_data = step._transform(data_with_zero_std)
 
-    # Expect NaN for division by zero
-    assert torch.isnan(transformed_data[:, 1]).all()
-    assert not torch.isnan(transformed_data[:, 0]).any()
-    assert not torch.isnan(transformed_data[:, 2]).any()
+    # After epsilon fix: no NaN, all values should be finite
+    assert not torch.isnan(transformed_data).any(), (
+        "Zero std column should not produce NaN after epsilon fix"
+    )
+    assert torch.isfinite(transformed_data).all(), (
+        "All values should be finite after epsilon fix"
+    )
+    # The constant column (column 1) should have values close to 0 since (x - mean) = 0
+    assert torch.allclose(transformed_data[:, 1], torch.zeros(3), atol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -584,3 +595,93 @@ def test__get_subsample_indices_for_estimators():
     for subsample_index in subsample_indices:
         assert subsample_index is not None
         assert len(subsample_index) == 2
+
+
+# --- Bug fix tests ---
+
+
+def test_fingerprint_train_test_hash_consistency():
+    """Test that identical rows get the same hash in both train and test modes.
+
+    This tests the fix for the double-salting bug where test path was hashing
+    X + 2*salt while training was hashing X + salt, causing fingerprints to
+    not match between train/test for identical rows.
+    """
+    rng = np.random.default_rng(42)
+    X = rng.random((10, 5))
+
+    step = AddFingerprintFeaturesStep(random_state=42)
+
+    # Fit on the data
+    step._fit(X, categorical_features=[])
+
+    # Transform in training mode (is_test=False) using internal method
+    train_X = step._transform(X, is_test=False)
+
+    # Transform in test mode (is_test=True) using internal method
+    test_X = step._transform(X, is_test=True)
+
+    # The fingerprint is the last column
+    train_fingerprints = train_X[:, -1]
+    test_fingerprints = test_X[:, -1]
+
+    # For identical rows, the hashes should be the same in train and test
+    # (Note: training has collision handling, so we check the first occurrence)
+    # Check that at least the first row's fingerprint matches
+    assert np.isclose(train_fingerprints[0], test_fingerprints[0]), (
+        "First row fingerprint should match between train and test"
+    )
+
+
+def test_fingerprint_identical_rows_same_hash_in_test():
+    """Test that identical rows produce the same hash in test mode."""
+    # Create data with duplicate rows
+    X = np.array([
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+        [1.0, 2.0, 3.0],  # Duplicate of row 0
+    ])
+
+    step = AddFingerprintFeaturesStep(random_state=42)
+    step._fit(X, categorical_features=[])
+
+    # Transform in test mode using internal method
+    test_X = step._transform(X, is_test=True)
+
+    # The fingerprint is the last column
+    fingerprints = test_X[:, -1]
+
+    # Identical rows should have the same fingerprint in test mode
+    assert np.isclose(fingerprints[0], fingerprints[2]), (
+        "Identical rows should have the same fingerprint in test mode"
+    )
+
+
+def test_skew_constant_feature_no_division_by_zero():
+    """Test that _skew returns 0.0 for constant features instead of NaN/Inf.
+
+    This tests the fix for division by zero when std is 0.
+    """
+    # Constant feature (all same values)
+    constant_feature = np.array([5.0, 5.0, 5.0, 5.0, 5.0])
+
+    result = _skew(constant_feature)
+
+    # Should return 0.0, not NaN or Inf
+    assert result == 0.0, f"Expected 0.0 for constant feature, got {result}"
+    assert np.isfinite(result), "Skew of constant feature should be finite"
+
+
+def test_skew_normal_feature():
+    """Test that _skew returns reasonable values for non-constant features."""
+    # Symmetric feature (should have skew close to 0)
+    symmetric = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+    skew_symmetric = _skew(symmetric)
+    assert np.isfinite(skew_symmetric)
+    assert abs(skew_symmetric) < 0.1, "Symmetric data should have near-zero skew"
+
+    # Right-skewed feature
+    right_skewed = np.array([1.0, 1.0, 1.0, 1.0, 10.0])
+    skew_right = _skew(right_skewed)
+    assert np.isfinite(skew_right)
+    assert skew_right > 0, "Right-skewed data should have positive skew"

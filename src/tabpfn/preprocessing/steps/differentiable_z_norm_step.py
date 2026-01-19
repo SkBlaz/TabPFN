@@ -30,7 +30,9 @@ class DifferentiableZNormStep(FeaturePreprocessingTransformerStep):
     def _transform(self, X: torch.Tensor, *, is_test: bool = False) -> torch.Tensor:  # type: ignore
         assert X.shape[1] == self.means.shape[1]
         assert X.shape[1] == self.stds.shape[1]
-        return (X - self.means) / self.stds
+        # Add epsilon to avoid division by zero for constant features
+        eps = 1e-8
+        return (X - self.means) / (self.stds + eps)
 
 
 __all__ = [

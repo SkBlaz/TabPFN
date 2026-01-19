@@ -123,7 +123,10 @@ def _add_safe_standard_to_safe_power_without_standard(
 
 def _skew(x: np.ndarray) -> float:
     """skewness: 3 * (mean - median) / std."""
-    return float(3 * (np.nanmean(x, 0) - np.nanmedian(x, 0)) / np.std(x, 0))
+    std = np.std(x, 0)
+    if std == 0:
+        return 0.0
+    return float(3 * (np.nanmean(x, 0) - np.nanmedian(x, 0)) / std)
 
 
 class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
