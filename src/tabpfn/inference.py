@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from copy import deepcopy
@@ -857,6 +858,7 @@ class _PerDeviceModelCache:
     def __init__(self, model: Architecture) -> None:
         """Create a new instance."""
         super().__init__()
+        self._lock = threading.RLock()
         self._models: dict[torch.device, Architecture] = {
             _get_current_device(model): model
         }
@@ -869,20 +871,21 @@ class _PerDeviceModelCache:
         any references to models previously obtained with .get_model() after calling
         this function.
         """
-        spare_models = [
-            model for device, model in self._models.items() if device not in devices
-        ]
+        with self._lock:
+            spare_models = [
+                model for device, model in self._models.items() if device not in devices
+            ]
 
-        def get_on_device(device: torch.device) -> Architecture:
-            """Get the model on the given device. Try to reuse existing models."""
-            if device in self._models:
-                return self._models[device]
-            if len(spare_models) > 0:
-                return spare_models.pop().to(device)
-            existing_model = next(iter(self._models.values()))
-            return deepcopy(existing_model).to(device)
+            def get_on_device(device: torch.device) -> Architecture:
+                """Get the model on the given device. Try to reuse existing models."""
+                if device in self._models:
+                    return self._models[device]
+                if len(spare_models) > 0:
+                    return spare_models.pop().to(device)
+                existing_model = next(iter(self._models.values()))
+                return deepcopy(existing_model).to(device)
 
-        self._models = {device: get_on_device(device) for device in devices}
+            self._models = {device: get_on_device(device) for device in devices}
 
     def get(self, device: torch.device) -> Architecture:
         """Return the model on the given device.
@@ -891,16 +894,19 @@ class _PerDeviceModelCache:
             KeyError: If a device is specified that was not included in the last call to
                 .to()
         """
-        return self._models[device]
+        with self._lock:
+            return self._models[device]
 
     def set_dtype(self, dtype: torch.dtype) -> None:
         """Set the dtype of the model's parameters."""
-        for model in self._models.values():
-            model.type(dtype)
+        with self._lock:
+            for model in self._models.values():
+                model.type(dtype)
 
     def get_devices(self) -> list[torch.device]:
         """Return the devices that are in use."""
-        return list(self._models.keys())
+        with self._lock:
+            return list(self._models.keys())
 
 
 def _get_current_device(model: Architecture) -> torch.device:
