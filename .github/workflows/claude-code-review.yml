@@ -1,0 +1,95 @@
+name: Claude Code Review
+
+on:
+  # `synchronize` intentionally excluded: the auto-review is for PR
+  # terminal states (first open / marked-ready / reopened), not every
+  # commit push. At ~$1 per run this previously billed once per force-push
+  # × every open PR. Re-reviews after a push are available on demand by
+  # commenting `@claude review` (handled by claude.yml).
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+    # Restrict review to actual code changes; skip docs / generated files /
+    # config-only PRs to bound Anthropic API spend on each PR event.
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+
+# Default to no permissions; the claude-review job grants what it needs.
+permissions: {}
+
+jobs:
+  claude-review:
+    # Skip fork PRs entirely. Fork-origin runs cannot access the
+    # ANTHROPIC_API_KEY secret (GitHub policy), so the review would no-op
+    # anyway — gating here avoids wasting Actions minutes and produces a
+    # cleaner workflow-run history.
+    #
+    # Skip Dependabot PRs: the Claude action will fail by default on them.
+    #
+    # Skip release PRs: `release-create-pr.yml` opens them as
+    # github-actions[bot], and the action hard-fails on bot actors that are not
+    # in `allowed_bots` ("Workflow initiated by non-human actor"). They match
+    # the `paths` filter only because they bump `pyproject.toml`, and they
+    # contain no reviewable code — just a version bump and the Towncrier
+    # changelog build. `check-changelog.yml` skips them on the same grounds.
+    if: >-
+      github.event.pull_request.head.repo.fork == false &&
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'release/v')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # `write` required to post the review back to the PR. Without it the
+      # action runs (and bills) but silently fails on the post step —
+      # `permission_denials_count > 0` in the SDK result and no review on
+      # the PR. `claude.yml` (the opt-in `@claude` mention workflow) sets
+      # this for the same reason.
+      pull-requests: write
+      issues: read
+      # Required by claude-code-action to mint a short-lived OIDC token that attests
+      # that this is a real GitHub action run to Anthropic's backend. Despite being
+      # called "write", does not grant any additional access to GitHub itself. See
+      # https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws#adding-permissions-settings
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run Claude Code Review
+        id: claude-review
+        # Pinned to v1 commit SHA to mitigate moving-tag supply-chain risk.
+        # When updating, resolve the new tag's underlying commit via
+        #   gh api /repos/anthropics/claude-code-action/git/refs/tags/<tag>
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636  # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          # By default "--comment" causes Claude to comment even when there are no
+          # issues. We extend the prompt to try and persuade it to stay silent.
+          # "Step 7" comes from https://github.com/anthropics/claude-code/blob/main/plugins/code-review/commands/code-review.md
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment
+
+            Override step 7 of the /code-review:code-review command: if no
+            validated issues are found, do not post any comment (skip the
+            "No issues found" summary). Only post inline comments when issues
+            exist.
+          # Allow Claude to post comments back to the PR. Various other tools are
+          # allowed in addition by default.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+          # Log the actual model output when the job was re-run with
+          # "Enable debug logging" ticked. We normally keep this off to avoid writing
+          # secrets to the logs.
+          show_full_output: ${{ runner.debug == '1' }}
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options

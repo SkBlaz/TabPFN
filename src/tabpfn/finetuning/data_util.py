@@ -1,11 +1,13 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Utilities for data preparation used in fine-tuning wrappers."""
 
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from typing_extensions import override
 
 import numpy as np
@@ -13,15 +15,14 @@ import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedKFold
 
-from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
-from tabpfn.preprocessing import (
-    EnsembleConfig,
-    fit_preprocessing,
-)
+from tabpfn.architectures.shared.bar_distribution import FullSupportBarDistribution
+from tabpfn.preprocessing.datamodel import FeatureModality, FeatureSchema
+from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
 from tabpfn.utils import infer_random_state, pad_tensors
 
 if TYPE_CHECKING:
     from tabpfn.constants import XType, YType
+    from tabpfn.preprocessing import EnsembleConfig
 
 
 @dataclass
@@ -78,6 +79,36 @@ class RegressorBatch:
     znorm_space_bardist: FullSupportBarDistribution
     X_query_raw: torch.Tensor
     y_query_raw: torch.Tensor
+
+
+Batch = TypeVar("Batch", ClassifierBatch, RegressorBatch)
+BatchShapeSignature = tuple[tuple[int, ...], ...]
+
+
+def _batch_shape_signature(
+    item: ClassifierBatch | RegressorBatch,
+) -> BatchShapeSignature:
+    """Return all model-input shapes, in estimator order."""
+    if not (len(item.X_context) == len(item.X_query) == len(item.y_context)):
+        raise RuntimeError("Internal error: inconsistent ensemble lengths.")
+    return (
+        *(
+            shape
+            for xc, xq, yc in zip(
+                item.X_context, item.X_query, item.y_context, strict=True
+            )
+            for shape in (tuple(xc.shape), tuple(xq.shape), tuple(yc.shape))
+        ),
+        tuple(item.y_query.shape),
+    )
+
+
+def _group_batches_by_shape(items: list[Batch]) -> list[list[tuple[int, Batch]]]:
+    """Group compatibly shaped items, preserving first-seen and input order."""
+    groups: dict[BatchShapeSignature, list[tuple[int, Batch]]] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(_batch_shape_signature(item), []).append((index, item))
+    return list(groups.values())
 
 
 @dataclass
@@ -307,7 +338,8 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
         configs (Sequence[Union[RegressorDatasetConfig, ClassifierDatasetConfig]]):
             Stores the input dataset configuration collection.
         split_fn (Callable): Stores the splitting function.
-        rng (np.random.Generator): Stores the random number generator.
+        random_state (int | np.random.Generator): Stores the random number generator.
+            If int, the preprocessing will always use the same random seed.
         n_preprocessing_jobs (int): The number of worker processes that will be used for
             the preprocessing.
         stratify (bool): Whether to stratify the data when splitting with split_fn.
@@ -316,7 +348,7 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
     def __init__(
         self,
         split_fn: Callable,
-        rng: np.random.Generator,
+        random_state: np.random.Generator | int,
         dataset_config_collection: Sequence[
             RegressorDatasetConfig | ClassifierDatasetConfig
         ],
@@ -326,7 +358,7 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
     ) -> None:
         self.configs = dataset_config_collection
         self.split_fn = split_fn
-        self.rng = rng
+        self.random_state = random_state
         self.n_preprocessing_jobs = n_preprocessing_jobs
         self.stratify = stratify
 
@@ -430,29 +462,29 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
         else:
             y_train = y_train_raw
 
-        itr = fit_preprocessing(
+        num_columns = x_train_raw.shape[1]
+        feature_schema = FeatureSchema.from_only_categorical_indices(
+            cat_ix, num_columns
+        )
+        ensemble_preprocessor = TabPFNEnsemblePreprocessor(
             configs=conf,
+            n_samples=x_train_raw.shape[0],
+            feature_schema=feature_schema,
+            random_state=self.random_state,
+            n_preprocessing_jobs=self.n_preprocessing_jobs,
+        )
+        ensemble_members = ensemble_preprocessor.fit_transform_ensemble_members(
             X_train=x_train_raw,
             y_train=y_train,
-            random_state=self.rng,
-            cat_ix=cat_ix,
-            n_preprocessing_jobs=self.n_preprocessing_jobs,
-            parallel_mode="block",
         )
-        (
-            configs,
-            preprocessors,
-            X_trains_preprocessed,
-            y_trains_preprocessed,
-            cat_ixs,
-        ) = list(zip(*itr))
-        X_trains_preprocessed = list(X_trains_preprocessed)
-        y_trains_preprocessed = list(y_trains_preprocessed)
+        X_trains_preprocessed = [m.X_train for m in ensemble_members]
+        y_trains_preprocessed = [m.y_train for m in ensemble_members]
+        feature_schema_preprocessed = [m.feature_schema for m in ensemble_members]
 
         ## Process test data for all ensemble estimators.
-        X_tests_preprocessed = []
-        for _, estim_preprocessor in zip(configs, preprocessors):
-            X_tests_preprocessed.append(estim_preprocessor.transform(x_test_raw).X)
+        X_tests_preprocessed = [
+            m.transform_X_test(x_test_raw) for m in ensemble_members
+        ]
 
         ## Convert to tensors.
         for i in range(len(X_trains_preprocessed)):
@@ -479,6 +511,10 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
         x_test_raw = torch.from_numpy(x_test_raw)
         y_test_raw = torch.from_numpy(y_test_raw)
 
+        cat_indices = [
+            m.indices_for(FeatureModality.CATEGORICAL)
+            for m in feature_schema_preprocessed
+        ]
         # Return structured batch data using dataclasses for clarity
         if is_regression_task:
             return RegressorBatch(
@@ -486,7 +522,7 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
                 X_query=X_tests_preprocessed,
                 y_context=y_trains_preprocessed,
                 y_query=y_test_standardized,
-                cat_indices=list(cat_ixs),
+                cat_indices=cat_indices,
                 configs=list(conf),
                 raw_space_bardist=raw_space_bardist_,
                 znorm_space_bardist=znorm_space_bardist_,
@@ -499,7 +535,7 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
             X_query=X_tests_preprocessed,
             y_context=y_trains_preprocessed,
             y_query=y_test_raw,
-            cat_indices=list(cat_ixs),
+            cat_indices=cat_indices,
             configs=list(conf),
         )
 
@@ -613,12 +649,19 @@ def meta_dataset_collator(
         A collated ClassifierBatch or RegressorBatch with stacked/padded data.
 
     Note:
-        Currently only implemented and tested for `batch_size = 1`,
-        as enforced by an internal assertion.
+        ``batch_size > 1`` stacks several datasets along the model's batch
+        dimension (used by batched inference). Tensors are padded to a common
+        shape, so callers that need exact, per-dataset-equivalent results must
+        prove the post-preprocessing shapes match before calling this collator.
+        For ``RegressorBatch`` the bar distributions are taken from the first
+        item only; batched regressor decoding applies each dataset's own bar
+        distribution downstream, after the fused forward.
     """
-    batch_sz = len(batch)
-    assert batch_sz == 1, "Only Implemented and tested for batch size of 1"
-
+    # batch_size > 1 stacks multiple independent datasets along the model's batch
+    # dimension, enabling a single fused forward over all of them (the transformer
+    # batch dim is independent). Tensors are padded to a common shape; when the
+    # datasets share post-preprocessing shapes no padding occurs. Raw shapes alone
+    # are insufficient because fitted transforms can remove or add columns.
     first_item = batch[0]
     num_estimators = len(first_item.X_context)
 
@@ -651,6 +694,15 @@ def meta_dataset_collator(
         X_query_raw=_collate_tensor_field(batch, "X_query_raw", padding_val),
         y_query_raw=_collate_tensor_field(batch, "y_query_raw", padding_val),
     )
+
+
+def _collate_same_shape_for_batched_inference(items: list[Batch]) -> Batch:
+    """Collate inference items only when padding is a no-op."""
+    if not items:
+        raise RuntimeError("Internal error: cannot collate an empty inference group.")
+    if len({_batch_shape_signature(item) for item in items}) != 1:
+        raise RuntimeError("Internal error: inference group has heterogeneous shapes.")
+    return meta_dataset_collator(items)  # type: ignore[return-value]
 
 
 def shuffle_and_chunk_data(
@@ -715,7 +767,7 @@ def shuffle_and_chunk_data(
     )
 
 
-def get_preprocessed_dataset_chunks(
+def get_preprocessed_dataset_chunks(  # noqa: PLR0913
     calling_instance: Any,
     X_raw: XType | list[XType],
     y_raw: YType | list[YType],
@@ -724,7 +776,8 @@ def get_preprocessed_dataset_chunks(
     model_type: Literal["regressor", "classifier"],
     *,
     equal_split_size: bool,
-    seed: int,
+    data_shuffle_seed: int,
+    preprocessing_random_state: int | np.random.Generator,
     shuffle: bool = True,
     force_no_stratify: bool = False,
 ) -> DatasetCollectionWithPreprocessing:
@@ -745,8 +798,9 @@ def get_preprocessed_dataset_chunks(
             max_data_size.
             If False, splits into chunks of size `max_data_size`, with
             the last chunk having the remainder samples but is dropped if its
-            size is less than 2.
-        seed: int. Random seed to use for the data shuffling and splitting.
+            size is less than min_chunk_size (default: 2000).
+        data_shuffle_seed: int. Random seed to use for the data shuffling and splitting.
+        preprocessing_random_state: Random state to use for the preprocessing.
         shuffle: If True, shuffle the data before splitting.
         force_no_stratify: If True, do not stratify the data even if the model
             type is classification. If None, use the model type to determine whether
@@ -762,19 +816,17 @@ def get_preprocessed_dataset_chunks(
     assert len(X_raw) == len(y_raw), "X and y lists must have the same length."
 
     if not hasattr(calling_instance, "models_") or calling_instance.models_ is None:
-        _, rng = calling_instance._initialize_model_variables()
-    else:
-        _, rng = infer_random_state(calling_instance.random_state)
+        calling_instance._initialize_model_variables()
 
     X_split, y_split = [], []
-    for X_item, y_item in zip(X_raw, y_raw):
+    for X_item, y_item in zip(X_raw, y_raw, strict=True):
         if max_data_size is not None:
             Xparts, yparts = shuffle_and_chunk_data(
                 X_item,
                 y_item,
                 max_chunk_size=max_data_size,
                 equal_split_size=equal_split_size,
-                seed=seed,
+                seed=data_shuffle_seed,
                 task=("multiclass" if model_type == "classifier" else "regression"),
                 shuffle=shuffle,
             )
@@ -786,13 +838,18 @@ def get_preprocessed_dataset_chunks(
     dataset_config_collection: list[
         RegressorDatasetConfig | ClassifierDatasetConfig
     ] = []
-    for X_item, y_item in zip(X_split, y_split):
+    for X_item, y_item in zip(X_split, y_split, strict=True):
         if model_type == "classifier":
             ensemble_configs, X_mod, y_mod = (
-                calling_instance._initialize_dataset_preprocessing(X_item, y_item, rng)
+                calling_instance._initialize_dataset_preprocessing(
+                    X=X_item,
+                    y=y_item,
+                    random_state=preprocessing_random_state,
+                )
             )
-            current_cat_ix = calling_instance.inferred_categorical_indices_
-
+            current_cat_ix = calling_instance.inferred_feature_schema_.indices_for(
+                FeatureModality.CATEGORICAL
+            )
             dataset_config = ClassifierDatasetConfig(
                 config=ensemble_configs,
                 X_raw=X_mod,
@@ -801,9 +858,15 @@ def get_preprocessed_dataset_chunks(
             )
         elif model_type == "regressor":
             ensemble_configs, X_mod, y_mod, bardist_ = (
-                calling_instance._initialize_dataset_preprocessing(X_item, y_item, rng)
+                calling_instance._initialize_dataset_preprocessing(
+                    X=X_item,
+                    y=y_item,
+                    random_state=preprocessing_random_state,
+                )
             )
-            current_cat_ix = calling_instance.inferred_categorical_indices_
+            current_cat_ix = calling_instance.inferred_feature_schema_.indices_for(
+                FeatureModality.CATEGORICAL
+            )
             dataset_config = RegressorDatasetConfig(
                 config=ensemble_configs,
                 X_raw=X_mod,
@@ -818,7 +881,7 @@ def get_preprocessed_dataset_chunks(
 
     return DatasetCollectionWithPreprocessing(
         split_fn,
-        rng=rng,
+        random_state=preprocessing_random_state,
         dataset_config_collection=dataset_config_collection,
         stratify=False if force_no_stratify else (model_type == "classifier"),
     )

@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Some utility functions for training."""
 
 from __future__ import annotations
@@ -6,8 +8,9 @@ import copy
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import torch
 from torch.optim import AdamW

@@ -1,16 +1,37 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Preprocessor and ensemble config objects."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Literal
 from typing_extensions import override
 
 if TYPE_CHECKING:
     import numpy as np
-    import numpy.typing as npt
     from sklearn.base import TransformerMixin
     from sklearn.pipeline import Pipeline
+
+
+class FeatureSubsamplingMethod(str, Enum):
+    """Method for subsampling features if dataset exceeds max_features_per_estimator."""
+
+    BALANCED = "balanced"
+    RANDOM = "random"
+    CONSTANT_AND_BALANCED = "constant_and_balanced"
+    GINI_FEATURE_IMPORTANCE = "gini_feature_importance"
+    AUTO = "auto"
+
+
+class SampleSubsamplingMethod(str, Enum):
+    """Method for subsampling rows per estimator when SUBSAMPLE_SAMPLES is set."""
+
+    AUTO = "auto"
+    BALANCED = "balanced"
+    STRATIFIED = "stratified"
+    MAJORITY_DOWNSAMPLE = "majority_downsample"
 
 
 @dataclass(frozen=True, eq=True)
@@ -35,10 +56,13 @@ class PreprocessorConfig:
             each estimator independently. If append to original is set to True we can
             still have more features.
         global_transformer_name: Name of the global transformer to use.
+        max_onehot_cardinality: Maximum number of unique values a categorical feature
+            can have to be one-hot encoded. Features with higher cardinality are passed
+            through unchanged to ordinal encoding. If None, all categorical features
+            are one-hot encoded.
     """
 
     name: Literal[
-        "per_feature",  # a different transformation for each feature
         "power",  # a standard sklearn power transformer
         "safepower",  # a power transformer that prevents some numerical issues
         "power_box",
@@ -49,6 +73,7 @@ class PreprocessorConfig:
         "quantile_norm",
         "quantile_uni_fine",
         "quantile_norm_fine",
+        "quantile_uni_extrapolate",
         "squashing_scaler_default",
         "squashing_scaler_max10",
         "robust",  # a standard sklearn robust scaler
@@ -99,12 +124,12 @@ class PreprocessorConfig:
     max_features_per_estimator: int = 500
     global_transformer_name: (
         Literal[
-            "scaler",
             "svd",
             "svd_quarter_components",
         ]
         | None
     ) = None
+    max_onehot_cardinality: int | None = None
     differentiable: bool = False
 
     @override
@@ -133,8 +158,11 @@ class EnsembleConfig:
         polynomial_features: Maximum number of polynomial features to add, if any.
         feature_shift_count: How much to shift the features columns.
         feature_shift_decoder: How to shift features.
-        subsample_ix: Indices of samples to use for this ensemble member.
-            If `None`, no subsampling is done.
+        outlier_removal_std: Number of standard deviations from the mean to consider a
+            sample an outlier. If `None`, no outliers are removed.
+        passthrough_inf: Whether to pass infinite values through to the model.
+            When True, the preprocessing pipeline replaces infinities with NaN
+            before preprocessing and restores them afterwards.
     """
 
     preprocess_config: PreprocessorConfig
@@ -142,9 +170,10 @@ class EnsembleConfig:
     polynomial_features: Literal["no", "all"] | int
     feature_shift_count: int
     feature_shift_decoder: Literal["shuffle", "rotate"] | None
-    subsample_ix: npt.NDArray[np.int64] | None  # OPTIM: Could use uintp
+    outlier_removal_std: float | None
     # Internal index specifying which model to use for this ensemble member.
     _model_index: int
+    passthrough_inf: bool
 
 
 @dataclass
@@ -164,6 +193,7 @@ class RegressorEnsembleConfig(EnsembleConfig):
 __all__ = [
     "ClassifierEnsembleConfig",
     "EnsembleConfig",
+    "FeatureSubsamplingMethod",
     "PreprocessorConfig",
     "RegressorEnsembleConfig",
 ]

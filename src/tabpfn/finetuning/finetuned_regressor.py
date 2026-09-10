@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """A TabPFN regressor that finetunes the underlying model for a single task.
 
 This module provides the FinetunedTabPFNRegressor class, which wraps TabPFN
@@ -21,13 +23,17 @@ from sklearn.utils.validation import check_is_fitted
 from tabpfn import TabPFNRegressor
 from tabpfn.finetuning.finetuned_base import EvalResult, FinetunedTabPFNBase
 from tabpfn.finetuning.train_util import clone_model_for_evaluation
-from tabpfn.model_loading import get_n_out
+from tabpfn.regression_metrics import (
+    ranked_probability_score_loss_from_bar_logits,
+)
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tabpfn.constants import XType, YType
+    from tabpfn.constants import ModelVersion, XType, YType
     from tabpfn.finetuning.data_util import RegressorBatch
+    from tabpfn.finetuning.logging import FinetuningLogger
+    from tabpfn.regressor import RegressionResultType
 
 
 def _compute_regression_loss(  # noqa: C901
@@ -91,22 +97,22 @@ def _compute_regression_loss(  # noqa: C901
         total_loss = total_loss + ce_loss_weight * ce_losses_BQ.mean()
 
     if crps_loss_weight > 0.0:
-        crps_loss = _ranked_probability_score_loss_from_bar_logits(
+        crps_losses_BQ = ranked_probability_score_loss_from_bar_logits(
             logits_BQL=logits_BQL,
             targets_BQ=targets_BQ,
             bardist_loss_fn=bardist_loss_fn,
             loss_type="crps",
         )
-        total_loss = total_loss + crps_loss_weight * crps_loss
+        total_loss = total_loss + crps_loss_weight * crps_losses_BQ.mean()
 
     if crls_loss_weight > 0.0:
-        crls_loss = _ranked_probability_score_loss_from_bar_logits(
+        crls_losses_BQ = ranked_probability_score_loss_from_bar_logits(
             logits_BQL=logits_BQL,
             targets_BQ=targets_BQ,
             bardist_loss_fn=bardist_loss_fn,
             loss_type="crls",
         )
-        total_loss = total_loss + crls_loss_weight * crls_loss
+        total_loss = total_loss + crls_loss_weight * crls_losses_BQ.mean()
 
     if mse_loss_weight > 0.0 or mae_loss_weight > 0.0:
         predictions_mean_BQ = bardist_loss_fn.mean(logits_BQL)
@@ -131,90 +137,6 @@ def _compute_regression_loss(  # noqa: C901
     return total_loss
 
 
-def _ranked_probability_score_loss_from_bar_logits(
-    *,
-    logits_BQL: torch.Tensor,
-    targets_BQ: torch.Tensor,
-    bardist_loss_fn: Any,
-    loss_type: Literal["crps", "crls"] = "crps",
-) -> torch.Tensor:
-    """Compute a ranked-probability loss from bar distribution logits.
-
-    This implements scoring rules for *ordered categorical* outcomes via the
-    cumulative distribution function (CDF), using the bar bins as ordered
-    categories. Definitions taken from https://scoringrules.readthedocs.io/en/latest/theory.html
-
-        CRPS (squared): sum_k=1^K w_k (CDF(k) - y_k)^2
-        CRLS (log):     -sum_k=1^K w_k log(|CDF(k) + y_k - 1|)
-
-    where K is the number of bins, w_k is the width of bin k, CDF(k) is the predicted
-    cumulative probability up to bin k, and y_k is the target cumulative
-    probability up to bin k.
-    The weighting uses bar/bin widths of the bar distribution.
-
-    Note that this is the RPS/RLS loss weighted by the bar/bin widths, so we refer
-    to it as 'Continuous' RPS/CRLS loss, i.e. CRPS/CRLS loss.
-
-    Shapes suffixes:
-        B=batch * estimators, L=logits, Q=n_queries.
-
-    Args:
-        logits_BQL: Bar distribution logits of shape (B, Q, L).
-        targets_BQ: Targets of shape (B, Q)
-        bardist_loss_fn: The BarDistribution instance used for bin mapping and
-            bucket index mapping.
-        loss_type: Which variant to compute. "crps" uses squared CDF differences,
-            "crls" uses a log score applied to the cumulative probabilities.
-
-    Returns:
-        A scalar mean loss.
-    """
-    bucket_widths_L = bardist_loss_fn.bucket_widths.to(logits_BQL.device)
-    assert bucket_widths_L.shape == (logits_BQL.shape[-1],), (
-        f"bucket_widths_L.shape: {bucket_widths_L.shape} "
-        f"logits_BQL.shape: {logits_BQL.shape}"
-    )
-    probs_BQL = torch.softmax(logits_BQL, dim=-1)
-    pred_cdf_BQL = torch.cumsum(probs_BQL, dim=-1)
-
-    ignore_loss_mask_BQ = torch.isnan(targets_BQ)
-    # Filled with zeros if the target is NaN.
-    # Will be ignored in final loss below.
-    filled_targets_BQ = torch.where(
-        ignore_loss_mask_BQ, torch.zeros_like(targets_BQ), targets_BQ
-    )
-
-    target_bins_BQ = bardist_loss_fn.map_to_bucket_idx(filled_targets_BQ).clamp(
-        0, bardist_loss_fn.num_bars - 1
-    )
-    # The target CDF is a step function: 0 for bins < target_bin, 1 for bins >=
-    # target_bin.
-    bin_indices_L = torch.arange(probs_BQL.shape[-1], device=probs_BQL.device)
-    target_cdf_BQL = (bin_indices_L.view(1, 1, -1) >= target_bins_BQ.unsqueeze(-1)).to(
-        probs_BQL.dtype
-    )
-
-    if loss_type == "crps":
-        cdf_diff_BQL = pred_cdf_BQL - target_cdf_BQL
-        cdf_term_losses_BQL = cdf_diff_BQL.square()
-    else:
-        eps = torch.finfo(pred_cdf_BQL.dtype).eps
-        cdf = pred_cdf_BQL.clamp(eps, 1 - eps)
-        # target_cdf_BQL is binary, so we can expand the log(|CDF(k) + y_k - 1|) term
-        # into two separate terms and use log1p. This is numerically more stable.
-        cdf_term_losses_BQL = target_cdf_BQL * (-torch.log(cdf)) + (
-            1 - target_cdf_BQL
-        ) * (-torch.log1p(-cdf))
-
-    weighted_term_losses_BQL = cdf_term_losses_BQL * bucket_widths_L.view(1, 1, -1)
-    crps_losses_BQ = weighted_term_losses_BQL.sum(dim=-1)
-
-    if ignore_loss_mask_BQ.any():
-        crps_losses_BQ[ignore_loss_mask_BQ] = 0.0
-
-    return crps_losses_BQ.mean()
-
-
 class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
     """A scikit-learn compatible wrapper for fine-tuning the TabPFNRegressor.
 
@@ -231,22 +153,31 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             is crucial for stable fine-tuning. Defaults to 1e-5.
         weight_decay: The weight decay for the AdamW optimizer. Defaults to 0.01.
         validation_split_ratio: Fraction of the original training data reserved
-            as a validation set for early stopping and monitoring. Defaults to 0.1.
+            as a validation set for early stopping and monitoring. Set to 0 or
+            None to disable validation: all data is then used for fine-tuning,
+            per-epoch evaluation is skipped, and early stopping is disabled.
+            Ignored when explicit validation data is passed to ``fit``.
+            Defaults to 0.1.
         n_finetune_ctx_plus_query_samples: The total number of samples per
             meta-dataset during fine-tuning (context plus query) before applying
-            the `finetune_ctx_query_split_ratio`. Defaults to 10_000.
+            the `finetune_ctx_query_split_ratio`. Defaults to 50_000.
         finetune_ctx_query_split_ratio: The proportion of each fine-tuning
             meta-dataset to use as query samples for calculating the loss. The
             remainder is used as context. Defaults to 0.2.
         n_inference_subsample_samples: The total number of subsampled training
-            samples per estimator during validation and final inference.
-            Defaults to 50_000.
+            samples per estimator during validation and final inference. If
+            None, no subsampling is applied and the full training set is used
+            as context. Defaults to None.
         random_state: Seed for reproducibility of data splitting and model
             initialization. Defaults to 0.
         early_stopping: Whether to use early stopping based on validation
             performance. Defaults to True.
-        early_stopping_patience: Number of epochs to wait for improvement before
-            early stopping. Defaults to 8.
+        early_stopping_patience: Number of validation checks to wait for
+            improvement before early stopping. Defaults to 8.
+        validation_frequency: Number of epochs between validation checks. A value
+            of 1 (default) validates after every epoch. The initial evaluation
+            of the unfine-tuned model still runs whenever validation data is
+            available. Must be a positive integer.
         min_delta: Minimum change in metric to be considered as an improvement.
             Defaults to 1e-4.
         grad_clip_value: Maximum norm for gradient clipping. If None, gradient
@@ -272,10 +203,18 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             Defaults to 8.
         use_activation_checkpointing: Whether to use activation checkpointing to
             reduce memory usage. Defaults to True.
+        shard_estimators_across_gpus: When True under DDP, shard the fine-tuning
+            estimators across ranks to reduce per-rank activation memory. Defaults
+            to False.
         save_checkpoint_interval: Number of epochs between checkpoint saves. This
             only has an effect if `output_dir` is provided during the `fit()` call.
             If None, no intermediate checkpoints are saved. The best model checkpoint
             is always saved regardless of this setting. Defaults to 10.
+        use_fixed_preprocessing_seed: Whether to use a fixed preprocessing seed.
+            If True, the preprocessing will always use the same random seed throughout
+            data batches. This is helpful in most cases because, e.g., the column order
+            will stay the same across batches.
+            If False, the preprocessing will use a different random seed for each batch.
 
         FinetunedTabPFNRegressor specific arguments:
 
@@ -310,13 +249,14 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         time_limit: int | None = None,
         learning_rate: float = 1e-5,
         weight_decay: float = 0.01,
-        validation_split_ratio: float = 0.1,
-        n_finetune_ctx_plus_query_samples: int = 10_000,
+        validation_split_ratio: float | None = 0.1,
+        n_finetune_ctx_plus_query_samples: int = 50_000,
         finetune_ctx_query_split_ratio: float = 0.2,
-        n_inference_subsample_samples: int = 50_000,
+        n_inference_subsample_samples: int | None = None,
         random_state: int = 0,
         early_stopping: bool = True,
         early_stopping_patience: int = 8,
+        validation_frequency: int = 1,
         min_delta: float = 1e-4,
         grad_clip_value: float | None = 1.0,
         use_lr_scheduler: bool = True,
@@ -325,7 +265,10 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         n_estimators_validation: int = 2,
         n_estimators_final_inference: int = 8,
         use_activation_checkpointing: bool = True,
+        shard_estimators_across_gpus: bool = False,
         save_checkpoint_interval: int | None = 10,
+        use_fixed_preprocessing_seed: bool = True,
+        experiment_logger: FinetuningLogger | None = None,
         extra_regressor_kwargs: dict[str, Any] | None = None,
         ce_loss_weight: float = 0.0,
         crps_loss_weight: float = 1.0,
@@ -335,6 +278,7 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         mae_loss_weight: float = 0.0,
         mae_loss_clip: float | None = None,
         eval_metric: Literal["mse"] | None = None,
+        model_version: ModelVersion | None = None,
     ):
         super().__init__(
             device=device,
@@ -349,6 +293,7 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             random_state=random_state,
             early_stopping=early_stopping,
             early_stopping_patience=early_stopping_patience,
+            validation_frequency=validation_frequency,
             min_delta=min_delta,
             grad_clip_value=grad_clip_value,
             use_lr_scheduler=use_lr_scheduler,
@@ -357,7 +302,11 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
             n_estimators_validation=n_estimators_validation,
             n_estimators_final_inference=n_estimators_final_inference,
             use_activation_checkpointing=use_activation_checkpointing,
+            shard_estimators_across_gpus=shard_estimators_across_gpus,
             save_checkpoint_interval=save_checkpoint_interval,
+            use_fixed_preprocessing_seed=use_fixed_preprocessing_seed,
+            experiment_logger=experiment_logger,
+            model_version=model_version,
         )
         self.extra_regressor_kwargs = extra_regressor_kwargs
         self.eval_metric = eval_metric
@@ -390,15 +339,12 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
     @override
     def _create_estimator(self, config: dict[str, Any]) -> TabPFNRegressor:
         """Create the TabPFNRegressor with the given config."""
-        return TabPFNRegressor(
+        return TabPFNRegressor.create_default_for_version(
+            version=self.finetune_model_version,
             **config,
             fit_mode="batched",
             differentiable_input=False,
         )
-
-    @override
-    def _setup_estimator(self) -> None:
-        """No additional setup needed for regressor at creation time."""
 
     @override
     def _should_skip_batch(self, batch: RegressorBatch) -> bool:  # type: ignore[override]
@@ -427,24 +373,24 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         y_query_batch = batch.y_query
         bardist_loss_fn = self._bardist_loss
 
-        _, per_estim_logits, _ = self.finetuned_estimator_.forward(X_query_batch)
+        _, per_estim_logits, _ = self._training_forward(X_query_batch)
         # per_estim_logits is a list (per estimator) of tensors with shape [Q, B(=1), L]
 
         # shape suffix: Q=n_queries, B=batch(=1), E=estimators, L=logits
         logits_QBEL = torch.stack(per_estim_logits, dim=2)
 
         Q, B, E, L = logits_QBEL.shape
-        num_bars = get_n_out(self.finetuned_estimator_.configs_[0], bardist_loss_fn)
+        num_bars = bardist_loss_fn.num_bars
         assert y_query_batch.shape[1] == Q
         assert B == 1
-        assert self.n_estimators_finetune == E
+        assert self._local_n_estimators_ == E
         assert num_bars == L
 
         # Reshape for bar distribution loss: treat estimator dim as batch dim
         # permute to shape (B, E, Q, L) then reshape to (B*E, Q, L)
         logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
 
-        targets_BQ = y_query_batch.repeat(B * self.n_estimators_finetune, 1).to(
+        targets_BQ = y_query_batch.repeat(B * self._local_n_estimators_, 1).to(
             self.device
         )
 
@@ -567,15 +513,17 @@ class FinetunedTabPFNRegressor(FinetunedTabPFNBase, RegressorMixin):
         return self
 
     @override
-    def predict(self, X: XType) -> np.ndarray:
+    def predict(self, X: XType, **kwargs) -> RegressionResultType:
         """Predict target values for X.
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            **kwargs: Additional keyword arguments to pass to the underlying
+                inference regressor (e.g., output_type, quantiles).
 
         Returns:
             The predicted target values with shape (n_samples,).
         """
         check_is_fitted(self)
 
-        return self.finetuned_inference_regressor_.predict(X)
+        return self.finetuned_inference_regressor_.predict(X, **kwargs)

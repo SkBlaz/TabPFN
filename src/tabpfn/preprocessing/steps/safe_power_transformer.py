@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Safe Power Transformer."""
 
 from __future__ import annotations
@@ -144,19 +146,30 @@ def _yeojohnson_inverse_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
     x_inv = np.zeros_like(x, dtype=dtype)
     pos = x >= 0
 
+    # Clip expm1 arguments to prevent overflow in the output dtype.
+    # Leave a small margin below log(max): expm1's float64 round-trip on the
+    # clipped value can land a few ULPs over dtype's max, which then overflows
+    # when cast back into x_inv (dtype). Nudge the bound down to absorb that.
+    log_max = np.log(np.finfo(dtype).max)
+    max_arg = log_max - 4 * np.spacing(log_max)
+
     # when x >= 0
     if abs(lmbda) < np.spacing(1.0):
-        x_inv[pos] = np.expm1(x[pos])
+        x_inv[pos] = np.expm1(np.clip(x[pos], -max_arg, max_arg))
     else:  # lmbda != 0
         # more stable version of: (x * lmbda + 1) ** (1 / lmbda) - 1
-        x_inv[pos] = np.expm1(np.log(x[pos] * lmbda + 1) / lmbda)
+        x_inv[pos] = np.expm1(
+            np.clip(np.log1p(x[pos] * lmbda) / lmbda, -max_arg, max_arg)
+        )
 
     # when x < 0
     if abs(lmbda - 2) > np.spacing(1.0):
         # more stable version of: 1 - (-(2 - lmbda) * x + 1) ** (1 / (2 - lmbda))
-        x_inv[~pos] = -np.expm1(np.log(-(2 - lmbda) * x[~pos] + 1) / (2 - lmbda))
+        x_inv[~pos] = -np.expm1(
+            np.clip(np.log1p(-(2 - lmbda) * x[~pos]) / (2 - lmbda), -max_arg, max_arg)
+        )
     else:  # lmbda == 2
-        x_inv[~pos] = -np.expm1(-x[~pos])
+        x_inv[~pos] = -np.expm1(np.clip(-x[~pos], -max_arg, max_arg))
 
     return x_inv
 

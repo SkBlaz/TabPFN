@@ -1,10 +1,13 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 from __future__ import annotations
 
 import io
 import itertools
 import os
+from collections.abc import Callable
 from itertools import product
-from typing import Callable, Literal
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -20,11 +23,10 @@ from sklearn.utils.estimator_checks import parametrize_with_checks
 from torch import nn
 
 from tabpfn import TabPFNClassifier
-from tabpfn.architectures import base
-from tabpfn.architectures.base.config import ModelConfig
+from tabpfn.architectures import tabpfn_v2_5
 from tabpfn.base import ClassifierModelSpecs, initialize_tabpfn_model
 from tabpfn.constants import ModelVersion
-from tabpfn.inference_config import InferenceConfig
+from tabpfn.inference_config import DEFAULT_SOFTMAX_TEMPERATURE, InferenceConfig
 from tabpfn.inference_tuning import (
     MIN_NUM_SAMPLES_RECOMMENDED_FOR_TUNING,
     ClassifierEvalMetrics,
@@ -61,8 +63,42 @@ def X_y() -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-model_sources = [ModelSource.get_classifier_v2(), ModelSource.get_classifier_v2_5()]
-fit_modes = ["low_memory", "fit_preprocessors", "fit_with_cache"]
+model_sources = [
+    ModelSource.get_classifier_v2(),
+    ModelSource.get_classifier_v2_5(),
+    ModelSource.get_classifier_v3(),
+    ModelSource.get_v3_5(),
+    ModelSource.get_v3_5_fast(),
+]
+fit_modes = ["low_memory", "fit_preprocessors"]
+
+
+def test__show_progress_bar__is_configurable() -> None:
+    model = TabPFNClassifier(show_progress_bar=True)
+    assert model.show_progress_bar is True
+    assert model.get_params()["show_progress_bar"] is True
+
+    default_model = TabPFNClassifier()
+    assert default_model.show_progress_bar is False
+    assert default_model.get_params()["show_progress_bar"] is False
+
+
+def test__predict__show_progress_bar_true__tiny_dataset_does_not_crash() -> None:
+    model = TabPFNClassifier(n_estimators=1, show_progress_bar=True, random_state=42)
+    X, y = sklearn.datasets.make_classification(
+        n_samples=9,
+        n_features=3,
+        n_informative=3,
+        n_redundant=0,
+        n_classes=3,
+        random_state=0,
+    )
+
+    model.fit(X, y)
+
+    predictions = model.predict(X)
+
+    assert predictions.shape == (X.shape[0],)
 
 
 @pytest.mark.parametrize(
@@ -79,7 +115,7 @@ fit_modes = ["low_memory", "fit_preprocessors", "fit_with_cache"]
 def test__fit_predict__passes_sklearn_check_and_outputs_correct_shape(
     device: str,
     n_estimators: int,
-    fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache"],
+    fit_mode: Literal["low_memory", "fit_preprocessors"],
     inference_precision: torch.types._dtype | Literal["autocast", "auto"],
     X_y: tuple[np.ndarray, np.ndarray],
 ) -> None:
@@ -277,7 +313,8 @@ def test__predict_logits__output_has_correct_properties_and_consistent_with_prob
     # Ensure y is int64 for consistency with classification tasks
     y = y.astype(np.int64)
 
-    classifier = TabPFNClassifier(
+    classifier = TabPFNClassifier.create_default_for_version(
+        version=ModelVersion.V2_5,
         n_estimators=n_estimators,
         device=device,
         softmax_temperature=softmax_temperature,
@@ -493,32 +530,126 @@ def test_balance_probabilities_alters_proba_output() -> None:
     )
 
 
-@pytest.mark.skip(
-    reason="The result is actually different depending on the fitting mode."
+@pytest.mark.parametrize(
+    "model_version",
+    [
+        ModelVersion.V2,
+        ModelVersion.V2_5,
+        ModelVersion.V2_6,
+        ModelVersion.V3,
+        ModelVersion.V3_5,
+        ModelVersion.V3_5_FAST,
+    ],
 )
-def test_fit_modes_all_return_equal_results(
+# Disable MPS as it doesn't support float64.
+@pytest.mark.parametrize("device", [d for d in get_pytest_devices() if d != "mps"])
+def test__fit_preprocessors_and_with_cache_produce_equal_results(
     X_y: tuple[np.ndarray, np.ndarray],
+    model_version: ModelVersion,
+    device: str,
 ) -> None:
-    kwargs = {"n_estimators": 2, "device": "auto", "random_state": 0}
+    kwargs = {
+        "version": model_version,
+        "n_estimators": 2,
+        "inference_precision": torch.float64,
+        "random_state": 0,
+        "device": device,
+    }
     X, y = X_y
 
     torch.random.manual_seed(0)
-    tabpfn = TabPFNClassifier(fit_mode="fit_preprocessors", **kwargs)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
     tabpfn.fit(X, y)
     probs = tabpfn.predict_proba(X)
     preds = tabpfn.predict(X)
 
     torch.random.manual_seed(0)
-    tabpfn = TabPFNClassifier(fit_mode="fit_with_cache", **kwargs)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="fit_with_cache", kv_cache_precision="auto", **kwargs
+    )
     tabpfn.fit(X, y)
     np.testing.assert_array_almost_equal(probs, tabpfn.predict_proba(X))
     np.testing.assert_array_equal(preds, tabpfn.predict(X))
 
+
+@pytest.mark.parametrize(
+    "model_version", [ModelVersion.V3, ModelVersion.V3_5, ModelVersion.V3_5_FAST]
+)
+@pytest.mark.parametrize("device", get_pytest_devices())
+def test__fit_preprocessors_and_with_cache_with_quantized_kv_cache__v3_family(
+    X_y: tuple[np.ndarray, np.ndarray], model_version: ModelVersion, device: str
+) -> None:
+    kwargs = {
+        "version": model_version,
+        "n_estimators": 2,
+        "inference_precision": torch.float32,
+        "random_state": 0,
+        "device": device,
+    }
+    X, y = X_y
+
     torch.random.manual_seed(0)
-    tabpfn = TabPFNClassifier(fit_mode="low_memory", **kwargs)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
+    tabpfn.fit(X, y)
+    probs = tabpfn.predict_proba(X)
+    preds = tabpfn.predict(X)
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="fit_with_cache", **kwargs
+    )
+    tabpfn.fit(X, y)
+    np.testing.assert_array_almost_equal(probs, tabpfn.predict_proba(X), decimal=2)
+    np.testing.assert_allclose(preds, tabpfn.predict(X), rtol=0.1)
+
+
+@pytest.mark.parametrize("model_version", list(ModelVersion))
+# Disable MPS as it doesn't support float64.
+@pytest.mark.parametrize("device", [d for d in get_pytest_devices() if d != "mps"])
+def test__fit_preprocessors_and_low_memory_produce_equal_results(
+    X_y: tuple[np.ndarray, np.ndarray], model_version: ModelVersion, device: str
+) -> None:
+    kwargs = {
+        "version": model_version,
+        "n_estimators": 2,
+        "inference_precision": torch.float64,
+        "random_state": 0,
+        "device": device,
+    }
+    X, y = X_y
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="fit_preprocessors", **kwargs
+    )
+    tabpfn.fit(X, y)
+    probs = tabpfn.predict_proba(X)
+    preds = tabpfn.predict(X)
+
+    torch.random.manual_seed(0)
+    tabpfn = TabPFNClassifier.create_default_for_version(
+        fit_mode="low_memory", **kwargs
+    )
     tabpfn.fit(X, y)
     np.testing.assert_array_almost_equal(probs, tabpfn.predict_proba(X))
     np.testing.assert_array_equal(preds, tabpfn.predict(X))
+
+
+@pytest.mark.parametrize("model_version", list(ModelVersion))
+def test__fit_and_predict__on_demo_dataset__accuracy_reasonable(
+    model_version: ModelVersion,
+) -> None:
+    X, y = sklearn.datasets.load_iris(return_X_y=True)
+    model = TabPFNClassifier.create_default_for_version(
+        version=model_version, random_state=0
+    )
+    model.fit(X, y)
+    accuracy = accuracy_score(y, model.predict(X))
+    assert accuracy > 0.97
 
 
 # TODO(eddiebergman): Should probably run a larger suite with different configurations
@@ -696,7 +827,12 @@ def test_onnx_exportable_cpu(X_y: tuple[np.ndarray, np.ndarray]) -> None:
         pytest.skip("onnx export is not tested on windows")
     X, y = X_y
     with torch.no_grad():
-        classifier = TabPFNClassifier(n_estimators=1, device="cpu", random_state=42)
+        classifier = TabPFNClassifier.create_default_for_version(
+            ModelVersion.V2_5,
+            n_estimators=1,
+            device="cpu",
+            random_state=42,
+        )
         # load the model so we can access it via classifier.models_
         classifier.fit(X, y)
         # this is necessary if cuda is available
@@ -751,18 +887,10 @@ def test_get_embeddings(
 
     embeddings = model.get_embeddings(X, data_source)
 
-    # Need to access the model through the executor
-    model_instance = next(iter(model.executor_.model_caches[0]._models.values()))
-    encoder_shape = next(
-        m.out_features
-        for m in model_instance.encoder.modules()
-        if isinstance(m, nn.Linear)
-    )
-
     assert isinstance(embeddings, np.ndarray)
     assert embeddings.shape[0] == n_estimators
     assert embeddings.shape[1] == X.shape[0]
-    assert embeddings.shape[2] == encoder_shape
+    assert embeddings.shape[2] == model.models_[0].embedding_dim
 
 
 def test_pandas_output_config(X_y: tuple[np.ndarray, np.ndarray]):
@@ -1066,7 +1194,7 @@ def test__fit_with_tuning_config__works_with_different_eval_metrics(
         assert (
             tabpfn_with_tuning.softmax_temperature_
             == tabpfn_no_tuning.softmax_temperature_
-            == tabpfn_with_tuning.softmax_temperature
+            == DEFAULT_SOFTMAX_TEMPERATURE
         )
 
 
@@ -1137,23 +1265,12 @@ def test__fit_with_small_dataset_and_tuning__warns() -> None:
         clf.fit(X, y)
 
 
-def test__fit_with_roc_auc_metric_with_threshold_tuning__warns() -> None:
-    """Test that warning is issued when ROC AUC metric used with threshold tuning."""
-    n_classes = 2
-    X, y = sklearn.datasets.make_classification(
-        n_samples=30 * n_classes,
-        n_classes=n_classes,
-        n_features=2,
-        n_informative=2,
-        n_redundant=0,
-        random_state=0,
-    )
-
-    clf = TabPFNClassifier(
+def _roc_auc_clf(y, *, tune_decision_thresholds: bool) -> TabPFNClassifier:
+    return TabPFNClassifier(
         eval_metric="roc_auc",
         tuning_config={
-            "tune_decision_thresholds": True,
-            "calibrate_temperature": False,
+            "tune_decision_thresholds": tune_decision_thresholds,
+            "calibrate_temperature": not tune_decision_thresholds,
             "tuning_holdout_frac": 0.1,
             "tuning_n_folds": 1,
         },
@@ -1165,12 +1282,104 @@ def test__fit_with_roc_auc_metric_with_threshold_tuning__warns() -> None:
         random_state=0,
     )
 
+
+def test__fit_with_roc_auc_metric_with_threshold_tuning__raises() -> None:
+    """roc_auc with tune_decision_thresholds=True is rejected."""
+    n_classes = 2
+    X, y = sklearn.datasets.make_classification(
+        n_samples=30 * n_classes,
+        n_classes=n_classes,
+        n_features=2,
+        n_informative=2,
+        n_redundant=0,
+        random_state=0,
+    )
+
+    clf = _roc_auc_clf(y, tune_decision_thresholds=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r".*roc_auc.*does not support tune_decision_thresholds=True.*",
+    ):
+        clf.fit(X, y)
+
+
+def test__fit_with_log_loss_metric_with_threshold_tuning__raises() -> None:
+    """log_loss with tune_decision_thresholds=True is rejected."""
+    n_classes = 2
+    X, y = sklearn.datasets.make_classification(
+        n_samples=30 * n_classes,
+        n_classes=n_classes,
+        n_features=2,
+        n_informative=2,
+        n_redundant=0,
+        random_state=0,
+    )
+
+    clf = TabPFNClassifier(
+        eval_metric="log_loss",
+        tuning_config={
+            "tune_decision_thresholds": True,
+            "calibrate_temperature": False,
+            "tuning_holdout_frac": 0.1,
+            "tuning_n_folds": 1,
+        },
+        n_estimators=1,
+        random_state=0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r".*log_loss.*does not support tune_decision_thresholds=True.*",
+    ):
+        clf.fit(X, y)
+
+
+def test__fit_with_log_loss_metric_with_temperature_calibration__is_allowed() -> None:
+    """Temperature calibration is the supported way to target log loss."""
+    n_classes = 2
+    X, y = sklearn.datasets.make_classification(
+        n_samples=30 * n_classes,
+        n_classes=n_classes,
+        n_features=2,
+        n_informative=2,
+        n_redundant=0,
+        random_state=0,
+    )
+
+    clf = TabPFNClassifier(
+        eval_metric="log_loss",
+        tuning_config={
+            "tune_decision_thresholds": False,
+            "calibrate_temperature": True,
+            "tuning_holdout_frac": 0.1,
+            "tuning_n_folds": 1,
+        },
+        n_estimators=1,
+        random_state=0,
+    )
+
+    clf.fit(X, y)
+    assert clf.predict_proba(X[:3]).shape == (3, n_classes)
+
+
+def test__fit_with_roc_auc_metric_with_temperature_calibration__warns() -> None:
+    """Temperature calibration stays allowed for roc_auc, but still warns."""
+    n_classes = 2
+    X, y = sklearn.datasets.make_classification(
+        n_samples=30 * n_classes,
+        n_classes=n_classes,
+        n_features=2,
+        n_informative=2,
+        n_redundant=0,
+        random_state=0,
+    )
+
+    clf = _roc_auc_clf(y, tune_decision_thresholds=False)
+
     with pytest.warns(
         UserWarning,
-        match=(
-            r".*with threshold tuning or temperature calibration "
-            r"enabled.*is independent of these tunings.*"
-        ),
+        match=r".*temperature calibration.*ROC AUC is independent of this tuning.*",
     ):
         clf.fit(X, y)
 
@@ -1178,18 +1387,16 @@ def test__fit_with_roc_auc_metric_with_threshold_tuning__warns() -> None:
 def _create_dummy_classifier_model_specs(
     max_num_classes: int = 10,
 ) -> ClassifierModelSpecs:
-    minimal_config = ModelConfig(
+    minimal_config = tabpfn_v2_5.TabPFNV2p5Config(
         emsize=8,
         features_per_group=1,
         max_num_classes=max_num_classes,
         nhead=2,
         nlayers=2,
-        remove_duplicate_features=True,
         num_buckets=100,
     )
-    model = base.get_architecture(
+    model = tabpfn_v2_5.get_architecture(
         config=minimal_config,
-        n_out=max_num_classes,
         cache_trainset_representation=False,
     )
     inference_config = InferenceConfig.get_default(
@@ -1207,8 +1414,8 @@ def test__create_default_for_version__v2__uses_correct_defaults() -> None:
     estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V2)
 
     assert isinstance(estimator, TabPFNClassifier)
-    assert estimator.n_estimators == 8
-    assert estimator.softmax_temperature == 0.9
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
     assert isinstance(estimator.model_path, str)
     assert "classifier" in estimator.model_path
     assert "-v2-" in estimator.model_path
@@ -1218,11 +1425,61 @@ def test__create_default_for_version__v2_5__uses_correct_defaults() -> None:
     estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V2_5)
 
     assert isinstance(estimator, TabPFNClassifier)
-    assert estimator.n_estimators == 8
-    assert estimator.softmax_temperature == 0.9
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
     assert isinstance(estimator.model_path, str)
     assert "classifier" in estimator.model_path
     assert "-v2.5-" in estimator.model_path
+
+
+def test__create_default_for_version__v2_6__uses_correct_defaults() -> None:
+    estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V2_6)
+
+    assert isinstance(estimator, TabPFNClassifier)
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
+    assert isinstance(estimator.model_path, str)
+    assert "classifier" in estimator.model_path
+    assert "-v2.6-" in estimator.model_path
+
+
+def test__create_default_for_version__v3__uses_correct_defaults() -> None:
+    estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V3)
+
+    assert isinstance(estimator, TabPFNClassifier)
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
+    assert isinstance(estimator.model_path, str)
+    assert "classifier" in estimator.model_path
+    assert "-v3-" in estimator.model_path
+
+
+def test__create_default_for_version__v3_5__uses_correct_defaults() -> None:
+    estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V3_5)
+
+    assert isinstance(estimator, TabPFNClassifier)
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
+    assert isinstance(estimator.model_path, str)
+    # One multitask checkpoint backs both estimators, so the estimator type is not
+    # part of the file name.
+    assert "-v3.5-" in estimator.model_path
+    assert "fast" not in estimator.model_path
+
+
+def test__create_default_for_version__v3_5_fast__uses_correct_defaults() -> None:
+    estimator = TabPFNClassifier.create_default_for_version(ModelVersion.V3_5_FAST)
+
+    assert isinstance(estimator, TabPFNClassifier)
+    assert estimator.n_estimators == "auto"
+    assert estimator.softmax_temperature == "auto"
+    assert isinstance(estimator.model_path, str)
+    assert "-v3.5-fast-" in estimator.model_path
+
+
+def test__create_default_for_version__unknown_version__raises() -> None:
+    with pytest.raises(ValueError, match="Unknown version"):
+        TabPFNClassifier.create_default_for_version("v99")  # type: ignore[arg-type]
 
 
 def test__create_default_for_version__passes_through_overrides() -> None:
@@ -1231,4 +1488,262 @@ def test__create_default_for_version__passes_through_overrides() -> None:
     )
 
     assert estimator.n_estimators == 16
-    assert estimator.softmax_temperature == 0.9
+    assert estimator.softmax_temperature == "auto"
+
+
+# =============================================================================
+# predict_proba_batched: batched multi-dataset inference (public API)
+# =============================================================================
+
+
+@pytest.mark.parametrize("device", devices)
+def test__predict_proba_batched__matches_per_dataset(device: str) -> None:
+    """The public predict_proba_batched API matches per-dataset fit+predict_proba.
+
+    Each dataset is preprocessed exactly as in standard inference, then all are
+    scored in one fused forward per estimator. Output is (n_datasets, n_test,
+    n_classes) and equals running each dataset alone to within float tolerance.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device requested but not available.")
+
+    def mkds(seed: int, n: int = 60, f: int = 5) -> tuple[np.ndarray, np.ndarray]:
+        r = np.random.RandomState(seed)
+        X = r.randn(n, f).astype(np.float32)
+        y = (X[:, 0] + 0.3 * r.randn(n) > 0).astype(int)
+        return X, y
+
+    data = [mkds(s) for s in range(3)]
+    X_tests = [d[0][:5] for d in data]
+
+    clf = TabPFNClassifier(
+        n_estimators=2,
+        device=device,
+        random_state=42,
+        inference_precision=torch.float32,
+    )
+    proba = clf.predict_proba_batched(
+        [d[0] for d in data], [d[1] for d in data], X_tests
+    )
+    assert proba.shape == (3, 5, 2)
+    assert np.allclose(proba.sum(-1), 1.0, atol=1e-4)
+
+    atol = 1e-4
+    for i, (X, y) in enumerate(data):
+        ref_clf = TabPFNClassifier(
+            n_estimators=2,
+            device=device,
+            random_state=42,
+            inference_precision=torch.float32,
+        )
+        ref_clf.fit(X, y)
+        ref = ref_clf.predict_proba(X_tests[i])
+        np.testing.assert_allclose(proba[i], ref, atol=atol)
+
+
+@pytest.mark.parametrize("device", devices)
+def test__predict_proba_batched__fp16_matches_fp32(device: str) -> None:
+    """predict_proba_batched works with inference_precision=float16 (regression).
+
+    The batched engine used to cast only the inputs to the forced dtype, leaving
+    the model in fp32, so an fp16 forward raised "mat1 and mat2 must have the same
+    dtype, but got Half and Float" on CPU (and a hard Metal assertion abort on MPS).
+    Standard predict_proba fp16 was unaffected. The crash reproduces on any device
+    once fp16 matmul is available, so we run it everywhere; older torch lacks CPU
+    fp16 matmul, so skip CPU there.
+    """
+    if torch.device(device).type == "cpu" and not is_cpu_float16_supported():
+        pytest.skip("CPU float16 matmul not supported in this PyTorch version.")
+
+    def mkds(seed: int, n: int = 60, f: int = 5) -> tuple[np.ndarray, np.ndarray]:
+        r = np.random.RandomState(seed)
+        X = r.randn(n, f).astype(np.float32)
+        y = (X[:, 0] + 0.3 * r.randn(n) > 0).astype(int)
+        return X, y
+
+    data = [mkds(s) for s in range(3)]
+    X_tests = [d[0][:5] for d in data]
+
+    clf = TabPFNClassifier(
+        n_estimators=2,
+        device=device,
+        random_state=42,
+        inference_precision=torch.float16,
+    )
+    # Regression: this call raised RuntimeError (CPU) / aborted (MPS) before the fix.
+    proba = clf.predict_proba_batched(
+        [d[0] for d in data], [d[1] for d in data], X_tests
+    )
+    assert proba.shape == (3, 5, 2)
+    assert np.allclose(proba.sum(-1), 1.0, atol=1e-3)
+
+    # And it should track the fp32 batched result.
+    ref = TabPFNClassifier(
+        n_estimators=2,
+        device=device,
+        random_state=42,
+        inference_precision=torch.float32,
+    ).predict_proba_batched([d[0] for d in data], [d[1] for d in data], X_tests)
+    if torch.device(device).type == "cuda":
+        np.testing.assert_allclose(proba, ref, atol=2e-2)
+    else:
+        assert np.abs(proba - ref).mean() < 5e-2
+
+
+def test__predict_proba_batched__rejects_mismatched_classes() -> None:
+    """predict_proba_batched raises if datasets do not share the same classes."""
+    r = np.random.RandomState(0)
+    X_bin = r.randn(40, 4).astype(np.float32)
+    y_bin = (X_bin[:, 0] > 0).astype(int)  # classes {0, 1}
+    X_multi = r.randn(40, 4).astype(np.float32)
+    y_multi = (X_multi[:, 0] * 2).astype(int) % 3  # classes {0, 1, 2}
+
+    clf = TabPFNClassifier(n_estimators=2, device="cpu", random_state=42)
+    with pytest.raises(ValueError, match=r"same.*set of classes"):
+        clf.predict_proba_batched(
+            [X_bin, X_multi], [y_bin, y_multi], [X_bin[:3], X_multi[:3]]
+        )
+
+
+@pytest.mark.parametrize("device", devices)
+def test__predict_proba_batched__matches_per_dataset_dataframe(device: str) -> None:
+    """Batched prediction matches per-dataset on non-numeric DataFrame inputs.
+
+    The standard predict path runs `clean_data_transform` -- dtype fixing and
+    ordinal encoding -- on X_test before the member preprocessors; predict_proba_batched
+    must apply the same validation or non-numeric inputs would diverge from (or
+    crash relative to) predict_proba. To actually exercise those paths the frames
+    here mix dtypes that need conversion: a categorical-dtype column, an
+    object/string column, and NaNs in both a numeric and the object column. The
+    NaNs land within the first 5 rows so X_test (the first 5 rows) exercises NaN
+    handling too, not just the training side.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device requested but not available.")
+
+    def mkdf(seed: int, n: int = 60) -> tuple[pd.DataFrame, np.ndarray]:
+        r = np.random.RandomState(seed)
+        num = r.randn(n, 3).astype(np.float32)
+        cat = r.choice(["a", "b", "c"], size=n)
+        txt = r.choice(["red", "green", "blue"], size=n).astype(object)
+        df = pd.DataFrame(
+            {
+                "f0": num[:, 0],
+                "f1": num[:, 1],
+                "f2": num[:, 2],
+                "cat": pd.Categorical(cat),  # categorical dtype
+                "txt": txt,  # object / string dtype
+            }
+        )
+        # Inject NaNs in a numeric and the object column within the first 5 rows
+        # (so X_test sees them) plus some beyond. f0 stays clean for the label.
+        df.loc[[1, 4, 17], "f1"] = np.nan
+        df.loc[[2, 4, 23], "txt"] = None
+        # Median split on the clean numeric column guarantees both classes are
+        # present in every dataset.
+        y = (num[:, 0] > np.median(num[:, 0])).astype(int)
+        return df, y
+
+    data = [mkdf(s) for s in range(3)]
+    X_tests = [d[0].iloc[:5] for d in data]
+
+    clf = TabPFNClassifier(
+        n_estimators=2,
+        device=device,
+        random_state=42,
+        inference_precision=torch.float32,
+    )
+    proba = clf.predict_proba_batched(
+        [d[0] for d in data], [d[1] for d in data], X_tests
+    )
+    assert proba.shape == (3, 5, 2)
+
+    atol = 1e-4
+    for i, (X, y) in enumerate(data):
+        ref = TabPFNClassifier(
+            n_estimators=2,
+            device=device,
+            random_state=42,
+            inference_precision=torch.float32,
+        )
+        ref.fit(X, y)
+        np.testing.assert_allclose(proba[i], ref.predict_proba(X_tests[i]), atol=atol)
+
+
+def test__predict_proba_batched__rejects_ragged() -> None:
+    """Ragged batches are rejected (padding would corrupt the fused forward)."""
+    r = np.random.RandomState(0)
+    X_a = r.randn(40, 4).astype(np.float32)
+    y_a = (X_a[:, 0] > 0).astype(int)
+    X_b = r.randn(30, 4).astype(np.float32)  # different number of training rows
+    y_b = (X_b[:, 0] > 0).astype(int)
+
+    clf = TabPFNClassifier(n_estimators=2, device="cpu", random_state=42)
+    with pytest.raises(ValueError, match=r"ragged"):
+        clf.predict_proba_batched([X_a, X_b], [y_a, y_b], [X_a[:3], X_b[:3]])
+
+
+def test__predict_proba_batched__rejects_balance_probabilities() -> None:
+    """balance_probabilities uses per-dataset class counts → unsupported, raises."""
+    r = np.random.RandomState(0)
+    X = r.randn(40, 4).astype(np.float32)
+    y = (X[:, 0] > 0).astype(int)
+
+    clf = TabPFNClassifier(
+        n_estimators=2, device="cpu", random_state=42, balance_probabilities=True
+    )
+    with pytest.raises(NotImplementedError, match=r"balance_probabilities"):
+        clf.predict_proba_batched([X, X], [y, y], [X[:3], X[:3]])
+
+
+def test__predict_proba_batched__rejects_float64_precision() -> None:
+    """float64 must raise rather than silently compute at float32.
+
+    The fused batch is built at float32 and predict_proba_batched bypasses the
+    float64 assert in _iter_forward_executor, so without this guard a float64
+    request returns float32-precision numbers while claiming predict parity.
+    """
+    r = np.random.RandomState(0)
+    X = r.randn(40, 4).astype(np.float32)
+    y = (X[:, 0] > 0).astype(int)
+
+    clf = TabPFNClassifier(
+        n_estimators=2, device="cpu", random_state=42, inference_precision=torch.float64
+    )
+    with pytest.raises(NotImplementedError, match=r"float64"):
+        clf.predict_proba_batched([X, X], [y, y], [X[:3], X[:3]])
+
+
+def test__predict_proba_batched__does_not_mutate_estimator() -> None:
+    """predict_proba_batched runs on an internal clone, leaving self untouched."""
+
+    def mk(seed: int, n: int = 60, f: int = 5) -> tuple[np.ndarray, np.ndarray]:
+        r = np.random.RandomState(seed)
+        X = r.randn(n, f).astype(np.float32)
+        y = (X[:, 0] > 0).astype(int)
+        return X, y
+
+    data = [mk(s) for s in range(3)]
+    X_list = [d[0] for d in data]
+    y_list = [d[1] for d in data]
+    X_tests = [d[0][:3] for d in data]
+
+    # An unfitted estimator stays unfitted (no executor_/classes_ left behind).
+    clf = TabPFNClassifier(n_estimators=2, device="cpu", random_state=42)
+    clf.predict_proba_batched(X_list, y_list, X_tests)
+    assert not hasattr(clf, "executor_")
+    assert not hasattr(clf, "classes_")
+
+    # A prior fit is preserved exactly across a batched call.
+    a_x, a_y = mk(99, n=80)
+    fitted = TabPFNClassifier(
+        n_estimators=2,
+        device="cpu",
+        random_state=42,
+        inference_precision=torch.float32,
+    )
+    fitted.fit(a_x, a_y)
+    before = fitted.predict_proba(a_x[:5])
+    fitted.predict_proba_batched(X_list, y_list, X_tests)
+    after = fitted.predict_proba(a_x[:5])
+    np.testing.assert_array_equal(before, after)

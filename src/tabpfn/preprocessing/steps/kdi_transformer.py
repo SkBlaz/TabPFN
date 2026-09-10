@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """KDI Transformer with NaN."""
 
 from __future__ import annotations
@@ -71,8 +73,13 @@ class KDITransformerWithNaN(KDITransformer):
                 copy=copy,
             )
 
-    def _more_tags(self) -> dict:
+    def _more_tags(self) -> dict:  # sklearn < 1.6
         return {"allow_nan": True}
+
+    def __sklearn_tags__(self):  # sklearn >= 1.6
+        tags = super().__sklearn_tags__()
+        tags.input_tags.allow_nan = True
+        return tags
 
     def fit(
         self,
@@ -122,6 +129,13 @@ class KDITransformerWithNaN(KDITransformer):
         X[nan_mask] = np.nan
 
         return X  # type: ignore
+
+    def fit_transform(
+        self, X: torch.Tensor | np.ndarray, y: Any | None = None
+    ) -> np.ndarray:
+        """Fit the transformer and transform the data."""
+        self.fit(X, y)
+        return self.transform(X)
 
 
 def get_all_kdi_transformers() -> dict[str, KDITransformerWithNaN]:

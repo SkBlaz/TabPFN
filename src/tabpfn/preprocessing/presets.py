@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Predefined preprocessor configurations for different model versions.
 
 This module provides factory functions that return preprocessor configurations
@@ -9,51 +11,6 @@ from __future__ import annotations
 from tabpfn.preprocessing.configs import PreprocessorConfig
 
 _V2_FEATURE_SUBSAMPLING_THRESHOLD = 1_000_000
-
-
-def default_classifier_preprocessor_configs() -> list[PreprocessorConfig]:
-    """Get default preprocessor configurations for classification."""
-    return [
-        PreprocessorConfig(
-            name="squashing_scaler_default",
-            append_original=False,
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd_quarter_components",
-            max_features_per_estimator=500,
-        ),
-        PreprocessorConfig(
-            name="none",
-            categorical_name="numeric",
-            max_features_per_estimator=500,
-        ),
-    ]
-
-
-def default_regressor_preprocessor_configs() -> list[PreprocessorConfig]:
-    """Default preprocessor configurations for regression.
-
-    These are the defaults used when training new models, which will then be stored in
-    the model checkpoint.
-
-    See `v2_regressor_preprocessor_configs()`, `v2_5_regressor_preprocessor_configs()`
-    for the preprocessing used earlier versions of the model.
-    """
-    return [
-        PreprocessorConfig(
-            name="quantile_uni_coarse",
-            append_original="auto",
-            categorical_name="numeric",
-            global_transformer_name=None,
-            max_features_per_estimator=500,
-        ),
-        PreprocessorConfig(
-            name="squashing_scaler_default",
-            append_original=False,
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd_quarter_components",
-            max_features_per_estimator=500,
-        ),
-    ]
 
 
 def v2_classifier_preprocessor_configs() -> list[PreprocessorConfig]:
@@ -127,8 +84,6 @@ def v2_5_regressor_preprocessor_configs() -> list[PreprocessorConfig]:
 
 __all__ = [
     "_V2_FEATURE_SUBSAMPLING_THRESHOLD",
-    "default_classifier_preprocessor_configs",
-    "default_regressor_preprocessor_configs",
     "v2_5_classifier_preprocessor_configs",
     "v2_5_regressor_preprocessor_configs",
     "v2_classifier_preprocessor_configs",

@@ -1,7 +1,10 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Test saving and loading of a fitted TabPFN classifier/regressor."""
 
 from __future__ import annotations
 
+import zipfile
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
@@ -14,10 +17,16 @@ from sklearn.datasets import make_classification, make_regression
 from tabpfn import TabPFNClassifier, TabPFNRegressor
 from tabpfn.architectures.interface import ArchitectureConfig
 from tabpfn.base import RegressorModelSpecs, initialize_tabpfn_model
-from tabpfn.inference_tuning import ClassifierEvalMetrics
-from tabpfn.model_loading import save_tabpfn_model
+from tabpfn.constants import ModelVersion
+from tabpfn.inference_tuning import ClassifierEvalMetrics, RegressorEvalMetrics
+from tabpfn.model_loading import (
+    load_fitted_tabpfn_model,
+    save_fitted_tabpfn_model,
+    save_tabpfn_model,
+)
+from tabpfn.utils import infer_devices
 
-from .utils import get_pytest_devices
+from .utils import get_pytest_devices, get_pytest_devices_with_mps_marked_slow
 
 
 def _make_regression_data() -> tuple[np.ndarray, np.ndarray]:
@@ -39,6 +48,43 @@ def _make_classification_data_with_categoricals() -> tuple[np.ndarray, np.ndarra
 device_pairs = [
     comb for comb in product(get_pytest_devices(), repeat=2) if comb.count("mps") != 1
 ]
+
+
+def _assert_roundtrip_predictions(
+    original: TabPFNClassifier | TabPFNRegressor,
+    loaded: TabPFNClassifier | TabPFNRegressor,
+    X: np.ndarray,
+    *,
+    cross_device: bool,
+) -> None:
+    """Check that a save/load round-trip produced an equivalent model.
+
+    Same-device round-trips must reproduce predictions near-exactly, so we
+    assert numerical equivalence. Cross-device round-trips (e.g.
+    ``cpu``<->``cuda``) cannot: CPU and GPU use different default inference
+    precisions and different matmul/attention kernels whose summation order
+    differs, so bit-identity is unattainable. For those we only verify that the
+    loaded model is functional.
+    """
+    original_preds = original.predict(X)
+    loaded_preds = loaded.predict(X)
+
+    if isinstance(original, TabPFNClassifier):
+        assert isinstance(loaded, TabPFNClassifier)
+        original_probas = original.predict_proba(X)
+        loaded_probas = loaded.predict_proba(X)
+        np.testing.assert_array_equal(original.classes_, loaded.classes_)
+
+    if cross_device:
+        # Values differ across hardware, but non-finite entries must line up.
+        np.testing.assert_array_equal(np.isnan(original_preds), np.isnan(loaded_preds))
+        np.testing.assert_array_equal(np.isinf(original_preds), np.isinf(loaded_preds))
+        return
+
+    # Same device: the round-trip must be numerically faithful.
+    np.testing.assert_array_almost_equal(original_preds, loaded_preds)
+    if isinstance(original, TabPFNClassifier):
+        np.testing.assert_array_almost_equal(original_probas, loaded_probas)
 
 
 @pytest.mark.parametrize(
@@ -66,6 +112,8 @@ def test__save_and_load_twice__predictions_equal_to_before_save(
     else:
         raise ValueError
 
+    cross_device = saving_device != loading_device
+
     original_model = estimator_class(device=saving_device, n_estimators=4)
     original_model.fit(X, y)
 
@@ -79,20 +127,54 @@ def test__save_and_load_twice__predictions_equal_to_before_save(
     assert isinstance(loaded_model_1, estimator_class)
     assert isinstance(loaded_model_2, estimator_class)
 
-    original_preds = original_model.predict(X)
-    np.testing.assert_array_almost_equal(original_preds, loaded_model_1.predict(X))
-    np.testing.assert_array_almost_equal(original_preds, loaded_model_2.predict(X))
+    _assert_roundtrip_predictions(
+        original_model, loaded_model_1, X, cross_device=cross_device
+    )
+    _assert_roundtrip_predictions(
+        original_model, loaded_model_2, X, cross_device=cross_device
+    )
 
-    if isinstance(original_model, TabPFNClassifier):
-        original_probas = original_model.predict_proba(X)
-        np.testing.assert_array_almost_equal(
-            original_probas, loaded_model_1.predict_proba(X)
-        )
-        np.testing.assert_array_almost_equal(
-            original_probas, loaded_model_2.predict_proba(X)
-        )
-        np.testing.assert_array_equal(original_model.classes_, loaded_model_1.classes_)
-        np.testing.assert_array_equal(original_model.classes_, loaded_model_2.classes_)
+
+@pytest.mark.parametrize("device", get_pytest_devices_with_mps_marked_slow())
+def test__save_fit_state__does_not_move_live_estimator_to_cpu(
+    device: str, tmp_path: Path
+) -> None:
+    """Saving must not mutate the live estimator.
+
+    ``nn.Module.to`` moves modules in place, so a naive CPU snapshot of fitted
+    attributes used to relocate the estimator's bar distributions, breaking
+    subsequent predictions on non-CPU devices.
+    """
+    X, y = _make_regression_data()
+    model = TabPFNRegressor(device=device, n_estimators=1)
+    model.fit(X, y)
+
+    model.save_fit_state(tmp_path / "model.tabpfn_fit")
+
+    assert model.znorm_space_bardist_.borders.device.type == torch.device(device).type
+    assert model.raw_space_bardist_.borders.device.type == torch.device(device).type
+    # These output types rely on the bar distributions living on the model device.
+    model.predict(X, output_type="median")
+    model.predict(X, output_type="quantiles")
+
+
+def test__save_fit_state__keeps_tabpfn_fit_parent_name(tmp_path: Path) -> None:
+    X, y = _make_regression_data()
+    model = TabPFNRegressor(device="cpu", n_estimators=1)
+    model.fit(X, y)
+    path = tmp_path / "project.tabpfn_fit" / "model.tabpfn_fit"
+
+    model.save_fit_state(path)
+
+    assert path.exists()
+    assert not (tmp_path / "project").exists()
+
+    with zipfile.ZipFile(path) as archive:
+        assert sorted(archive.namelist()) == [
+            "executor_state.joblib",
+            "fitted_attrs.joblib",
+            "init_params.json",
+        ]
 
 
 # --- Error Handling Tests ---
@@ -252,7 +334,228 @@ def test_saving_and_loading_with_tuning_config(
     path = tmp_path / "model.tabpfn_fit"
     estimator.fit(X, y)
     estimator.save_fit_state(path)
-    loaded_estimator = TabPFNClassifier.load_from_fit_state(path)
+    loaded_estimator = TabPFNClassifier.load_from_fit_state(path, device="cpu")
     assert loaded_estimator.tuned_classification_thresholds_ is not None
     assert loaded_estimator.softmax_temperature_ is not None
     assert loaded_estimator.eval_metric_ is ClassifierEvalMetrics.F1
+
+
+def test_saving_and_loading_regressor_with_tuning_config(
+    tmp_path: Path,
+) -> None:
+    """Test that a regressor's calibrated temperature survives a round-trip.
+
+    `save_fitted_tabpfn_model` picks up trailing-underscore attributes
+    automatically, so this needs no support in `model_loading.py`; the test is
+    here to prove that, and to catch a future blacklist entry that would drop
+    the calibration silently.
+    """
+    estimator = TabPFNRegressor(
+        device="cpu",
+        random_state=42,
+        eval_metric="nll",
+        # TODO: test the case when dataclass is used
+        tuning_config={
+            "calibrate_temperature": True,
+            "tuning_holdout_frac": 0.5,
+            "tuning_n_folds": 1,
+        },
+    )
+    X, y = make_regression(n_samples=50, n_features=5, noise=10.0, random_state=42)
+
+    path = tmp_path / "model.tabpfn_fit"
+    estimator.fit(X, y)
+    estimator.save_fit_state(path)
+    loaded_estimator = TabPFNRegressor.load_from_fit_state(path, device="cpu")
+
+    assert loaded_estimator.eval_metric_ is RegressorEvalMetrics.NLL
+    assert (
+        loaded_estimator.ensemble_softmax_temperature_
+        == estimator.ensemble_softmax_temperature_
+    )
+    # The temperature has to arrive as a live part of the predict path, not just as
+    # a stored number, so compare predictions rather than only the attribute.
+    _assert_roundtrip_predictions(estimator, loaded_estimator, X, cross_device=False)
+
+
+# --- fit_with_cache save/load tests ---
+
+
+@pytest.mark.parametrize(
+    ("task_type", "saving_device", "loading_device", "model_version"),
+    [
+        pytest.param(
+            task_type,
+            saving_device,
+            loading_device,
+            model_version,
+            marks=pytest.mark.slow,
+        )
+        if "mps" in (saving_device, loading_device)
+        else (task_type, saving_device, loading_device, model_version)
+        for task_type in ["regression", "classification"]
+        for (saving_device, loading_device) in device_pairs
+        for model_version in [ModelVersion.V2_5, ModelVersion.V3]
+    ],
+)
+def test__save_and_load_fit_with_cache__predictions_equal(
+    task_type: str,
+    saving_device: str,
+    loading_device: str,
+    model_version: ModelVersion,
+    tmp_path: Path,
+) -> None:
+    """Test that save/load round-trip works for fit_mode='fit_with_cache'."""
+    if task_type == "regression":
+        estimator_class = TabPFNRegressor
+        X, y = _make_regression_data()
+    else:
+        estimator_class = TabPFNClassifier
+        X, y = _make_classification_data_with_categoricals()
+
+    cross_device = saving_device != loading_device
+
+    original = estimator_class.create_default_for_version(
+        model_version,
+        device=saving_device,
+        n_estimators=4,
+        fit_mode="fit_with_cache",
+    )
+    original.fit(X, y)
+
+    path = tmp_path / "model.tabpfn_fit"
+    original.save_fit_state(path)
+    loaded = estimator_class.load_from_fit_state(path, device=loading_device)
+
+    assert isinstance(loaded, estimator_class)
+    _assert_roundtrip_predictions(original, loaded, X, cross_device=cross_device)
+
+
+@pytest.mark.parametrize(
+    ("task_type", "saving_device", "loading_device", "model_version"),
+    [
+        pytest.param(
+            task_type,
+            saving_device,
+            loading_device,
+            model_version,
+            marks=pytest.mark.slow,
+        )
+        if "mps" in (saving_device, loading_device)
+        else (task_type, saving_device, loading_device, model_version)
+        for task_type in ["regression", "classification"]
+        for (saving_device, loading_device) in device_pairs
+        for model_version in [ModelVersion.V2_5, ModelVersion.V3]
+    ],
+)
+def test__save_and_load_fit_with_cache_twice__predictions_equal(
+    task_type: str,
+    saving_device: str,
+    loading_device: str,
+    model_version: ModelVersion,
+    tmp_path: Path,
+) -> None:
+    """Test double save/load cycle for fit_with_cache stability."""
+    if task_type == "regression":
+        estimator_class = TabPFNRegressor
+        X, y = _make_regression_data()
+    else:
+        estimator_class = TabPFNClassifier
+        X, y = _make_classification_data_with_categoricals()
+
+    cross_device = saving_device != loading_device
+
+    original = estimator_class.create_default_for_version(
+        model_version,
+        device=saving_device,
+        n_estimators=4,
+        fit_mode="fit_with_cache",
+    )
+    original.fit(X, y)
+
+    path_1 = tmp_path / "model_1.tabpfn_fit"
+    original.save_fit_state(path_1)
+    loaded_1 = estimator_class.load_from_fit_state(path_1, device=loading_device)
+
+    path_2 = tmp_path / "model_2.tabpfn_fit"
+    loaded_1.save_fit_state(path_2)
+    loaded_2 = estimator_class.load_from_fit_state(path_2, device=loading_device)
+
+    _assert_roundtrip_predictions(original, loaded_2, X, cross_device=cross_device)
+
+
+@pytest.mark.parametrize("estimator_class", [TabPFNClassifier, TabPFNRegressor])
+def test__load_from_fit_state__without_device__resolves_like_auto(
+    estimator_class: type[TabPFNClassifier] | type[TabPFNRegressor],
+    tmp_path: Path,
+) -> None:
+    """Loading without a device must land where the constructor's "auto" points.
+
+    This defaulted to "cpu", so a GPU-fitted model silently reloaded onto CPU
+    and predicted orders of magnitude slower with nothing to signal it. The
+    intuitive repair, assigning to `.device`, cannot help: predict reads
+    `devices_`.
+    """
+    X, y = (
+        _make_regression_data()
+        if estimator_class is TabPFNRegressor
+        else _make_classification_data_with_categoricals()
+    )
+    model = estimator_class(device="cpu", n_estimators=2)
+    model.fit(X, y)
+    path = tmp_path / "model.tabpfn_fit"
+    model.save_fit_state(path)
+
+    loaded = estimator_class.load_from_fit_state(path)
+
+    assert loaded.device == "auto"
+    assert loaded.devices_ == infer_devices("auto")
+    assert len(loaded.predict(X)) == len(X)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", torch.device("cpu"), ["cpu"], [torch.device("cpu")]],
+    ids=["str", "torch_device", "list_of_str", "list_of_torch_device"],
+)
+def test__load_fitted_tabpfn_model__every_device_spec_form__loads_and_resaves(
+    device: str | torch.device | list[str | torch.device],
+    tmp_path: Path,
+) -> None:
+    """Every form the annotation accepts must reach the estimator unaltered.
+
+    The spec lands on the estimator as an init param, so a later save has to
+    render it for JSON.
+    """
+    X, y = _make_regression_data()
+    model = TabPFNRegressor(device="cpu", n_estimators=2)
+    model.fit(X, y)
+    path = tmp_path / "model.tabpfn_fit"
+    save_fitted_tabpfn_model(model, path)
+
+    loaded = load_fitted_tabpfn_model(path, device=device)
+
+    assert loaded.devices_ == (torch.device("cpu"),)
+    assert len(loaded.predict(X)) == len(X)
+    save_fitted_tabpfn_model(loaded, tmp_path / "resaved.tabpfn_fit")
+
+
+@pytest.mark.parametrize(
+    "device",
+    [torch.device("cpu"), [torch.device("cpu")]],
+    ids=["torch_device", "list_of_torch_device"],
+)
+def test__save_fitted_tabpfn_model__torch_device_init_param__serializes(
+    device: torch.device | list[torch.device],
+    tmp_path: Path,
+) -> None:
+    """A `torch.device` passed to the constructor must not break saving."""
+    X, y = _make_regression_data()
+    model = TabPFNRegressor(device=device, n_estimators=2)
+    model.fit(X, y)
+    path = tmp_path / "model.tabpfn_fit"
+
+    save_fitted_tabpfn_model(model, path)
+
+    reloaded = load_fitted_tabpfn_model(path, device="cpu")
+    assert len(reloaded.predict(X)) == len(X)

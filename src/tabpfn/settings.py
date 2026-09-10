@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Settings module for TabPFN configuration."""
 
 from __future__ import annotations
@@ -5,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,16 +35,50 @@ class TabPFNSettings(BaseSettings):
         "If not set, uses platform-specific user cache directory.",
     )
     model_version: ModelVersion = Field(
-        default=ModelVersion.V2_5,
+        default=ModelVersion.V3,
         description="The version of the TabPFN model to use by default.",
+    )
+
+    # Auth URLs (for browser-based license acceptance)
+    auth_gui_url: str = Field(
+        default="https://ux.priorlabs.ai",
+        description="PriorLabs login GUI URL.",
+    )
+    auth_api_url: str = Field(
+        default="https://api.priorlabs.ai",
+        description="URL for the PriorLabs API (token verification).",
     )
 
     # Performance/Memory Settings
     allow_cpu_large_dataset: bool = Field(
         default=False,
-        description="Allow running TabPFN on CPU with large datasets (>1000 samples). "
+        description="Allow running TabPFN on CPU with large datasets. "
         "Set to True to override the CPU limitation.",
     )
+    mps_memory_fraction: float = Field(
+        default=0.7,
+        description="Fraction of recommended max MPS memory to allow (0.0 to 2.0). "
+        "Used to prevent macOS system crashes on Apple Silicon. "
+        "Values > 1.0 are not recommended.",
+    )
+    max_batched_test_rows: int = Field(
+        default=32768,
+        ge=0,
+        description="Maximum number of test rows fed through the model in a single "
+        "forward pass during cached ('fit_with_cache') inference. Larger test sets "
+        "are chunked. Performance is close to optimal at the default of 32768. "
+        "Set to 0 to disable chunking.",
+    )
+
+    def model_post_init(self, _: Any) -> None:
+        """Configure MPS memory limits after settings are initialized.
+
+        To change the memory fraction, set the TABPFN_MPS_MEMORY_FRACTION
+        environment variable before importing tabpfn, e.g.:
+            export TABPFN_MPS_MEMORY_FRACTION=0.5
+        """
+        if torch.backends.mps.is_available():
+            torch.mps.set_per_process_memory_fraction(self.mps_memory_fraction)
 
 
 class PytorchSettings(BaseSettings):

@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Tests for TabPFN regressor finetuning functionality.
 
 This module contains regressor-specific tests for:
@@ -21,12 +23,13 @@ from sklearn.datasets import make_regression
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from tabpfn.architectures.base.bar_distribution import BarDistribution
+from tabpfn.architectures.shared.bar_distribution import BarDistribution
 from tabpfn.finetuning.data_util import (
     RegressorBatch,
     get_preprocessed_dataset_chunks,
     meta_dataset_collator,
 )
+from tabpfn.finetuning.finetuned_base import EvalResult
 from tabpfn.finetuning.finetuned_regressor import (
     FinetunedTabPFNRegressor,
     _compute_regression_loss,
@@ -95,6 +98,24 @@ def create_mock_architecture_forward_regression() -> Callable[..., torch.Tensor]
         )
 
     return mock_forward
+
+
+def make_improving_regression_eval_side_effect() -> Callable[..., EvalResult]:
+    """Side effect for ``_evaluate_model`` returning a strictly improving metric.
+
+    The regressor's primary metric is the mse (lower is better), so a steadily
+    decreasing mse guarantees an improvement over the default model and thus a
+    saved "best" checkpoint — independent of the mocked forward's randomness.
+    """
+    call_count = 0
+
+    def _evaluate(*_args: object, **_kwargs: object) -> EvalResult:
+        nonlocal call_count
+        mse = 1.0 - 0.1 * call_count
+        call_count += 1
+        return EvalResult(primary=mse)
+
+    return _evaluate
 
 
 @pytest.fixture(scope="module")
@@ -192,7 +213,7 @@ def test__finetuned_tabpfn_regressor__fit_and_predict(
 
     mock_forward = create_mock_architecture_forward_regression()
     with mock.patch(
-        "tabpfn.architectures.base.transformer.PerFeatureTransformer.forward",
+        "tabpfn.architectures.tabpfn_v3.TabPFNV3.forward",
         autospec=True,
         side_effect=mock_forward,
     ):
@@ -237,7 +258,9 @@ def test__regressor_checkpoint_contains_mse_metric(
         finetune_ctx_query_split_ratio=0.2,
         n_inference_subsample_samples=120,
         random_state=42,
-        early_stopping=False,
+        # Best checkpoints are only saved under early stopping; the improving
+        # eval side effect below keeps it from actually triggering.
+        early_stopping=True,
         use_lr_scheduler=False,
         n_estimators_finetune=1,
         n_estimators_validation=1,
@@ -246,10 +269,18 @@ def test__regressor_checkpoint_contains_mse_metric(
     )
 
     mock_forward = create_mock_architecture_forward_regression()
-    with mock.patch(
-        "tabpfn.architectures.base.transformer.PerFeatureTransformer.forward",
-        autospec=True,
-        side_effect=mock_forward,
+    with (
+        mock.patch(
+            "tabpfn.architectures.tabpfn_v3.TabPFNV3.forward",
+            autospec=True,
+            side_effect=mock_forward,
+        ),
+        mock.patch.object(
+            FinetunedTabPFNRegressor,
+            "_evaluate_model",
+            autospec=True,
+            side_effect=make_improving_regression_eval_side_effect(),
+        ),
     ):
         finetuned_reg.fit(X_train, y_train, output_dir=output_folder)
 
@@ -400,6 +431,48 @@ def test__compute_regression_loss__rps_vs_rls_matches_expected_value() -> None:
     assert combined_loss.item() == pytest.approx(expected_rps + expected_rls)
 
 
+@pytest.mark.parametrize(
+    "loss_weights",
+    [
+        {"ce_loss_weight": 1.0},
+        {"crps_loss_weight": 1.0},
+        {"crls_loss_weight": 1.0},
+        {"mse_loss_weight": 1.0},
+        {"mae_loss_weight": 1.0},
+        {"ce_loss_weight": 1.0, "crps_loss_weight": 1.0, "crls_loss_weight": 1.0},
+    ],
+)
+def test__compute_regression_loss__reduces_every_term_to_a_scalar(
+    loss_weights: dict[str, float],
+) -> None:
+    """Every term must be reduced before it is summed into the total.
+
+    `ranked_probability_score_loss_from_bar_logits` returns one loss per query, so a
+    term that forgets `.mean()` broadcasts `total_loss` to (B, Q) and `backward()`
+    fails. More than one query is essential here: with Q=1 an unreduced term still
+    holds a single element, so `.item()` succeeds and hides the missing reduction.
+    """
+    borders = torch.linspace(-2.0, 2.0, steps=9, dtype=torch.float32)
+    bardist_loss_fn = BarDistribution(borders=borders, ignore_nan_targets=True)
+    torch.manual_seed(0)
+    logits_BQL = torch.randn(
+        (2, 3, bardist_loss_fn.num_bars), dtype=torch.float32, requires_grad=True
+    )
+    targets_BQ = torch.tensor([[0.5, -1.0, 1.5], [-0.5, 1.0, 0.25]])
+
+    total_loss = _compute_regression_loss(
+        logits_BQL=logits_BQL,
+        targets_BQ=targets_BQ,
+        bardist_loss_fn=bardist_loss_fn,
+        **{"ce_loss_weight": 0.0, **loss_weights},
+    )
+
+    assert total_loss.shape == ()
+    # The symptom a non-scalar total actually produces during finetuning.
+    total_loss.backward()
+    assert logits_BQL.grad is not None
+
+
 def test_regressor_dataset_and_collator_batches_type(
     variable_synthetic_regression_dataset_collection: list[
         tuple[np.ndarray, np.ndarray]
@@ -417,7 +490,8 @@ def test_regressor_dataset_and_collator_batches_type(
         100,
         model_type="regressor",
         equal_split_size=True,
-        seed=42,
+        data_shuffle_seed=42,
+        preprocessing_random_state=0,
     )
 
     dl = DataLoader(

@@ -1,19 +1,28 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Example of fine-tuning a TabPFN classifier using the FinetunedTabPFNClassifier wrapper.
 
-Note: We recommend running the fine-tuning scripts on a CUDA-enabled GPU, as full
-support for the Apple Silicon (MPS) backend is still under development.
+Note: We recommend running the fine-tuning script on a CUDA-enabled GPU with 80 GB of VRAM.
+
+Multi-GPU: torchrun --nproc-per-node=N examples/finetune_classifier.py
+Note: Only call fit() once per torchrun session. For multiple finetuning runs, use
+separate torchrun invocations.
 """
 
+import gc
 import logging
+import os
 import warnings
 
 import numpy as np
 import sklearn.datasets
 import torch
+import torch.distributed as dist
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from tabpfn import TabPFNClassifier
+from tabpfn.finetuning import main_process_first
 from tabpfn.finetuning.finetuned_classifier import (
     FinetunedTabPFNClassifier,
 )
@@ -38,16 +47,18 @@ logging.basicConfig(
 # =============================================================================
 
 # Training hyperparameters
-NUM_EPOCHS = 30
-LEARNING_RATE = 2e-5
+NUM_EPOCHS = 100
+LEARNING_RATE = 1e-5
+N_FINETUNE_CTX_PLUS_QUERY_SAMPLES = 50_000
+EARLY_STOPPING_PATIENCE = 15
 
 # Ensemble configuration
 # number of estimators to use during finetuning
-NUM_ESTIMATORS_FINETUNE = 2
+NUM_ESTIMATORS_FINETUNE = 4
 # number of estimators to use during trian time validation
-NUM_ESTIMATORS_VALIDATION = 2
+NUM_ESTIMATORS_VALIDATION = 4
 # number of estimators to use during final inference
-NUM_ESTIMATORS_FINAL_INFERENCE = 8
+NUM_ESTIMATORS_FINAL_INFERENCE = 4
 
 # Reproducibility
 RANDOM_STATE = 0
@@ -61,9 +72,19 @@ def calculate_roc_auc(y_true: np.ndarray, y_pred_proba: np.ndarray) -> float:
 
 
 def main() -> None:
+    is_main_process = int(os.environ.get("LOCAL_RANK", "0")) == 0
+
     # We use the "Higgs" dataset (see https://www.openml.org/search?type=data&sort=runs&id=44129&status=active)
     # but only take a random subset of 100k samples for this example.
-    data = sklearn.datasets.fetch_openml(data_id=44129, as_frame=True, parser="auto")
+    # Under torchrun, the main process downloads the dataset first and the
+    # other ranks then read it from the warm sklearn cache — otherwise every
+    # rank would download it, and not all sklearn fetchers write their cache
+    # atomically.
+    with main_process_first():
+        data = sklearn.datasets.fetch_openml(
+            data_id=44129, as_frame=True, parser="auto"
+        )
+
     _, X_all, _, y_all = train_test_split(
         data.data,
         data.target,
@@ -76,52 +97,70 @@ def main() -> None:
         X_all, y_all, test_size=0.1, random_state=RANDOM_STATE, stratify=y_all
     )
 
-    print(
-        f"Loaded {len(X_train):,} samples for training and {len(X_test):,} samples for testing."
-    )
+    if is_main_process:
+        print(
+            f"Loaded {len(X_train):,} samples for training and "
+            f"{len(X_test):,} samples for testing."
+        )
 
-    # 2. Initial model evaluation on test set
-    base_clf = TabPFNClassifier(
-        device=[f"cuda:{i}" for i in range(torch.cuda.device_count())],
-        n_estimators=NUM_ESTIMATORS_FINAL_INFERENCE,
-        ignore_pretraining_limits=True,
-        inference_config={"SUBSAMPLE_SAMPLES": 50_000},
-    )
-    base_clf.fit(X_train, y_train)
+        # 2. Initial model evaluation on test set
+        base_clf = TabPFNClassifier(
+            device=[f"cuda:{i}" for i in range(torch.cuda.device_count())],
+            n_estimators=NUM_ESTIMATORS_FINAL_INFERENCE,
+            ignore_pretraining_limits=True,
+            random_state=RANDOM_STATE,
+        )
+        base_clf.fit(X_train, y_train)
 
-    base_pred_proba = base_clf.predict_proba(X_test)
-    roc_auc = calculate_roc_auc(y_test, base_pred_proba)
-    log_loss_score = log_loss(y_test, base_pred_proba)
+        base_pred_proba = base_clf.predict_proba(X_test)
+        roc_auc = calculate_roc_auc(y_test, base_pred_proba)
+        log_loss_score = log_loss(y_test, base_pred_proba)
 
-    print(f"📊 Default TabPFN Test ROC: {roc_auc:.4f}")
-    print(f"📊 Default TabPFN Test Log Loss: {log_loss_score:.4f}\n")
+        print(f"📊 Default TabPFN Test ROC: {roc_auc:.4f}")
+        print(f"📊 Default TabPFN Test Log Loss: {log_loss_score:.4f}\n")
+
+        del base_clf
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # 3. Initialize and run fine-tuning
-    print("--- 2. Initializing and Fitting Model ---\n")
+    if is_main_process:
+        print("--- 2. Initializing and Fitting Model ---\n")
 
     # Instantiate the wrapper with your desired hyperparameters
+    # To enable WandB logging, pass an experiment_logger:
+    # .  from tabpfn.finetuning.logging import WandbLogger
+    #   experiment_logger=WandbLogger(project="my-project", run_name="my-run", entity="my-entity")
     finetuned_clf = FinetunedTabPFNClassifier(
         device="cuda",
         epochs=NUM_EPOCHS,
         learning_rate=LEARNING_RATE,
+        lr_warmup_only=True,
+        eval_metric="log_loss",
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        n_finetune_ctx_plus_query_samples=N_FINETUNE_CTX_PLUS_QUERY_SAMPLES,
         n_estimators_finetune=NUM_ESTIMATORS_FINETUNE,
         n_estimators_validation=NUM_ESTIMATORS_VALIDATION,
         n_estimators_final_inference=NUM_ESTIMATORS_FINAL_INFERENCE,
+        random_state=RANDOM_STATE,
     )
 
     # 4. Call .fit() to start the fine-tuning process on the training data
     finetuned_clf.fit(X_train, y_train)
-    print("\n")
 
     # 5. Evaluate the fine-tuned model
-    print("--- 3. Evaluating Model on Held-out Test Set ---\n")
-    y_pred_proba = finetuned_clf.predict_proba(X_test)
+    if is_main_process:
+        print("\n--- 3. Evaluating Model on Held-out Test Set ---\n")
+        y_pred_proba = finetuned_clf.predict_proba(X_test)
 
-    roc_auc = calculate_roc_auc(y_test, y_pred_proba)
-    loss = log_loss(y_test, y_pred_proba)
+        roc_auc = calculate_roc_auc(y_test, y_pred_proba)
+        loss = log_loss(y_test, y_pred_proba)
 
-    print(f"📊 Finetuned TabPFN Test ROC: {roc_auc:.4f}")
-    print(f"📊 Finetuned TabPFN Test Log Loss: {loss:.4f}")
+        print(f"📊 Finetuned TabPFN Test ROC: {roc_auc:.4f}")
+        print(f"📊 Finetuned TabPFN Test Log Loss: {loss:.4f}")
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -1,35 +1,28 @@
 """A collection of random utilities for the TabPFN models."""
 
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 from __future__ import annotations
 
 import contextlib
 import os
+import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import numpy.typing as npt
 import torch
-from sklearn.base import (
-    TransformerMixin,
-)
 
-from tabpfn.architectures.encoders import (
-    MulticlassClassificationTargetEncoderStep,
-    SequentialEncoder,
-)
 from tabpfn.constants import (
     REGRESSION_NAN_BORDER_LIMIT_LOWER,
     REGRESSION_NAN_BORDER_LIMIT_UPPER,
 )
+from tabpfn.preprocessing.datamodel import Feature, FeatureModality, FeatureSchema
 
 if TYPE_CHECKING:
     from sklearn.base import TransformerMixin
     from sklearn.pipeline import Pipeline
-
-    from tabpfn.architectures.interface import Architecture
 
 MAXINT_RANDOM_SEED = int(np.iinfo(np.int32).max)
 
@@ -37,7 +30,7 @@ MAXINT_RANDOM_SEED = int(np.iinfo(np.int32).max)
 def get_autocast_context(
     device: torch.device, *, enabled: bool
 ) -> contextlib.AbstractContextManager:
-    """Returns a torch.autocast context manager, disabling it for MPS devices.
+    """Returns a torch.autocast context manager.
 
     Args:
         device: The torch device being used.
@@ -46,8 +39,6 @@ def get_autocast_context(
     Returns:
         A context manager for autocasting.
     """
-    if device.type == "mps":
-        return contextlib.nullcontext()
     return torch.autocast(device.type, enabled=enabled)
 
 
@@ -68,10 +59,10 @@ def _repair_borders(borders: np.ndarray, *, inplace: Literal[True]) -> None:
         nans = np.isnan(borders)
         largest = borders[~nans].max()
         borders[nans] = largest
-        borders[-1] = borders[-1] * 2
+        borders[-1] += np.abs(borders[-1])
 
     if borders[-1] - borders[-2] < 1e-6:
-        borders[-1] = borders[-1] * 1.1
+        borders[-1] += np.abs(borders[-1] * 0.1)
 
     if borders[0] == borders[1]:
         borders[0] -= np.abs(borders[0] * 0.1)
@@ -107,16 +98,16 @@ def _cancel_nan_borders(
     return borders, logit_cancel_mask
 
 
-DevicesSpecification = Union[
-    torch.device, str, Sequence[Union[torch.device, str]], Literal["auto"]
-]
+DevicesSpecification = (
+    torch.device | str | Sequence[torch.device | str] | Literal["auto"]
+)
 
 
 def infer_devices(devices: DevicesSpecification) -> tuple[torch.device, ...]:
     """Selects the appropriate PyTorch devices for inference.
 
     If `device` is "auto" then the devices are selected as follows:
-    1. If CUDA is available and not excluded, returns the first "cuda" device
+    1. If CUDA is available and not excluded, returns all available "cuda" devices
     2. Otherwise, if MPS is available and not excluded, returns the "mps" device
     3. Otherwise, returns the "cpu" device
 
@@ -144,10 +135,20 @@ def infer_devices(devices: DevicesSpecification) -> tuple[torch.device, ...]:
 
     if devices == "auto":
         if "cuda" not in exclude_devices and torch.cuda.is_available():
-            return (torch.device("cuda:0"),)
+            return tuple(
+                torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())
+            )
 
-        if _is_mps_supported() and "mps" not in exclude_devices:
-            return (torch.device("mps"),)
+        if "mps" not in exclude_devices and torch.backends.mps.is_available():
+            if _is_torch_mps_supported():
+                return (torch.device("mps"),)
+            warnings.warn(
+                "An MPS device is available, but TabPFN disables MPS for "
+                "PyTorch < 2.6 (earlier versions can give poor accuracy and "
+                "lack bfloat16 autocast support on the MPS backend). Falling "
+                "back to CPU. Install torch>=2.6 to use MPS.",
+                stacklevel=2,
+            )
 
         return (torch.device("cpu"),)
 
@@ -162,12 +163,17 @@ def infer_devices(devices: DevicesSpecification) -> tuple[torch.device, ...]:
             f"than once. It contained: {devices}"
         )
 
-    if not _is_mps_supported() and any(d.type == "mps" for d in devices):
-        raise ValueError(
-            "The MPS device was selected, "
-            "but this is not supported by TabPFN before PyTorch 2.5. "
-            'Set `device="cpu"` instead.'
-        )
+    if any(d.type == "mps" for d in devices):
+        if not torch.backends.mps.is_available():
+            raise ValueError(
+                "The MPS device was selected, but MPS is not available on this system."
+            )
+        if not _is_torch_mps_supported():
+            raise ValueError(
+                "The MPS device was selected, "
+                "but TabPFN requires PyTorch >= 2.6 for MPS. "
+                "Upgrade PyTorch, or set device='cpu' instead."
+            )
 
     return devices
 
@@ -186,13 +192,12 @@ def _parse_device(device: str | torch.device) -> torch.device:
     return device
 
 
-def _is_mps_supported() -> bool:
+def _is_torch_mps_supported() -> bool:
     """Return True if the MPS device is supported, otherwise False.
 
-    We have found that using MPS can lead to poor accuracy on PyTorch <2.5. See
-    https://github.com/PriorLabs/TabPFN/pull/619
+    We require PyTorch >= 2.6 for MPS to support all used operations.
     """
-    return torch.__version__ >= "2.5" and torch.backends.mps.is_available()
+    return torch.__version__ >= "2.6"
 
 
 def is_autocast_available(device_type: str) -> bool:
@@ -228,10 +233,42 @@ def is_autocast_available(device_type: str) -> bool:
         )
 
 
-def infer_fp16_inference_mode(
+def _cpu_supports_fast_bf16() -> bool:
+    """Whether the CPU accelerates bfloat16 (Intel AMX / AVX512-BF16, AMD Zen 4+).
+
+    Requires a torch build with oneDNN, which provides the fast bf16 kernels
+    (absent e.g. on macOS wheels, where CPU bf16 falls back to slow reference
+    kernels). AMX CPUs also enumerate AVX512-BF16, so this one check covers
+    both instruction sets.
+    """
+    # bf16 without oneDNN's fast kernels is far slower than float32. Official
+    # wheels always ship oneDNN; this guards distro/self-built torch without it.
+    if not torch.backends.mkldnn.is_available():
+        return False
+    # Private torch API with no public equivalent; if a torch release removes
+    # it, warn and stay on float32 rather than risk slow emulated bf16.
+    avx512_bf16 = getattr(torch.cpu, "_is_avx512_bf16_supported", None)
+    if avx512_bf16 is None:
+        warnings.warn(
+            "torch.cpu._is_avx512_bf16_supported() does not exist in this torch"
+            " version, so TabPFN cannot detect CPU bf16 support and disables"
+            " CPU bf16 autocast. Please report this at"
+            " https://github.com/PriorLabs/TabPFN/issues so detection can be"
+            " updated.",
+            stacklevel=2,
+        )
+        return False
+    return bool(avx512_bf16())
+
+
+def infer_autocast_inference_mode(
     devices: Sequence[torch.device], *, enable: bool | None
 ) -> bool:
-    """Infer whether fp16 inference should be enabled.
+    """Infer whether reduced-precision (autocast) inference should be enabled.
+
+    On GPU this is fp16 autocast; on CPU ``torch.autocast`` runs in bfloat16,
+    which is enabled only on CPUs with native bf16 support (see
+    :func:`_cpu_supports_fast_bf16`).
 
     Args:
         devices: The devices to validate against.
@@ -240,31 +277,38 @@ def infer_fp16_inference_mode(
             detect if it's possible and use it if so.
 
     Returns:
-        Whether to use fp16 inference or not.
+        Whether to use autocast inference or not.
 
     Raises:
-        ValueError: If fp16 inference was enabled and any of the selected devices do
+        ValueError: If autocast was enabled and any of the selected devices do
             not support it.
     """
     is_cpu = any(device.type.lower() == "cpu" for device in devices)
-    fp16_available = (
-        not is_cpu  # CPU can show enabled, yet it kills inference speed
-        and any(is_autocast_available(device.type) for device in devices)
-    )
+    if is_cpu:
+        # CPU autocast runs in bfloat16, which is only faster than float32 on CPUs
+        # with native bf16 support.
+        autocast_available = (
+            all(device.type.lower() == "cpu" for device in devices)
+            and is_autocast_available("cpu")
+            and _cpu_supports_fast_bf16()
+        )
+    else:
+        autocast_available = any(
+            is_autocast_available(device.type) for device in devices
+        )
 
     if enable is None:
-        return fp16_available
+        return autocast_available
 
     if enable is True:
-        if not fp16_available:
+        if not autocast_available:
             raise ValueError(
-                "You specified `fp16_inference=True`, however"
-                "`torch.amp.autocast_mode.is_autocast_available()`"
-                f" reported that one or more of the selected devices ({devices=})"
-                " does not support it."
-                "\nPlease ensure your version of torch and device type"
-                " are compatible with torch.autocast()`"
-                " or set `fp16_inference=False`.",
+                'You specified `inference_precision="autocast"`, however one or'
+                f" more of the selected devices ({devices=}) does not support it."
+                " On CPU, autocast requires hardware-accelerated bfloat16"
+                " (Intel AMX / AVX512-BF16, AMD Zen 4+)."
+                '\nSet `inference_precision="auto"` to fall back to full'
+                " precision automatically.",
             )
         return True
 
@@ -334,94 +378,87 @@ def _cdf(logits: torch.Tensor, borders: torch.Tensor, ys: torch.Tensor) -> torch
     return prob_left_of_ys.clip(0.0, 1.0)
 
 
-def translate_probs_across_borders(
+def _translate_probs_across_borders_unchunked(
     logits: torch.Tensor,
     *,
     frm: torch.Tensor,
     to: torch.Tensor,
 ) -> torch.Tensor:
+    prob_left = _cdf(logits, borders=frm, ys=to)
+    prob_left[..., 0] = 0.0
+    prob_left[..., -1] = 1.0
+    return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
+
+
+# `_cdf` allocates ~8 intermediate tensors of shape (batch, len(to)). Targeting
+# `chunk_size * len(to) <= _TRANSLATE_CHUNK_BUDGET_ELEMENTS` keeps each transient
+# around ~80 MB (fp32) and the total under ~1 GB, which holds translate_probs's
+# contribution to peak memory roughly constant in n_test.
+_TRANSLATE_CHUNK_BUDGET_ELEMENTS = 20_000_000
+
+
+def translate_probs_across_borders(
+    logits: torch.Tensor,
+    *,
+    frm: torch.Tensor,
+    to: torch.Tensor,
+    chunk_budget_elements: int = _TRANSLATE_CHUNK_BUDGET_ELEMENTS,
+) -> torch.Tensor:
     """Translate the probabilities across the borders.
 
+    For large batches the computation is chunked so that the peak memory
+    footprint of the intermediate ``(batch, len(to))`` tensors allocated
+    inside ``_cdf`` stays bounded. All batch dimensions are flattened
+    before chunking, so the memory cap holds regardless of which batch
+    dimension is large (e.g. `(n_estimators, n_test, num_buckets)`). The
+    output is numerically identical to the unchunked version.
+
     Args:
-        logits: The logits defining the distribution to translate.
+        logits: The logits defining the distribution to translate. The last
+            dimension indexes buckets from ``frm``; all leading dimensions
+            are treated as independent batch rows. Typical shapes are
+            ``(num_rows, num_buckets)`` (used by ``TabPFNRegressor.predict``)
+            or ``(n_estimators, num_rows, num_buckets)``.
         frm: The borders to translate from.
         to: The borders to translate to.
+        chunk_budget_elements: Maximum number of ``logits[..., -1]`` elements
+            processed per chunk. Defaults to a value that keeps each
+            ``_cdf`` transient near ~80 MB (fp32). Lower values reduce peak
+            memory at a small time cost; primarily useful for testing.
 
     Returns:
         The translated probabilities.
     """
-    prob_left = _cdf(logits, borders=frm, ys=to)
-    prob_left[..., 0] = 0.0
-    prob_left[..., -1] = 1.0
+    batch_shape = logits.shape[:-1]
+    num_buckets_frm = logits.shape[-1]
+    num_borders_to = to.shape[0]
+    num_buckets_to = num_borders_to - 1
 
-    return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
+    if len(batch_shape) == 0:
+        return _translate_probs_across_borders_unchunked(logits, frm=frm, to=to)
 
+    # Flatten batch dims so chunking is independent of which dim is large.
+    logits_flat = logits.reshape(-1, num_buckets_frm)
+    num_rows = logits_flat.shape[0]
+    # The dominant intermediates inside `_cdf` are of shape
+    # `(batch, num_borders_to)`, so budget against borders, not buckets.
+    chunk_size = max(1, chunk_budget_elements // max(num_borders_to, 1))
+    if num_rows <= chunk_size:
+        return _translate_probs_across_borders_unchunked(logits, frm=frm, to=to)
 
-def update_encoder_params(
-    models: list[Architecture],
-    remove_outliers_std: float | None,
-    seed: int | None,
-    *,
-    differentiable_input: bool = False,
-) -> None:
-    """Update the loaded encoder elements and setting to be compatible with inference
-    requirements. This concerns handling outliers in the model and also removes
-    non-differentiable steps from the label encoder.
-
-    !!! warning
-
-        This only happens inplace.
-
-    Args:
-        models: The models to update.
-        remove_outliers_std: The standard deviation to remove outliers.
-        seed: The seed to use, if any.
-        inplace: Whether to do the operation inplace.
-        differentiable_input: Whether the entire model including forward pass should
-            be differentiable with pt autograd. This disables non-differentiable
-            encoder steps.
-    """
-    if remove_outliers_std is not None and remove_outliers_std <= 0:
-        raise ValueError("remove_outliers_std must be greater than 0")
-
-    for model in models:
-        # TODO: find a less hacky way to change settings during training
-        # and inference
-        if not hasattr(model, "encoder"):
-            raise ValueError(
-                "Model does not have an encoder, this breaks the TabPFN sklearn "
-                "wrapper."
-            )
-
-        encoder = model.encoder
-
-        # TODO: maybe check that norm_layer even exists
-        norm_layer = next(
-            e for e in encoder if "InputNormalizationEncoderStep" in str(e.__class__)
+    # Preallocate output and write chunks in-place to avoid the transient
+    # `torch.cat` would create (which would double peak memory).
+    out_flat = torch.empty(
+        num_rows,
+        num_buckets_to,
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    for i in range(0, num_rows, chunk_size):
+        out_flat[i : i + chunk_size] = _translate_probs_across_borders_unchunked(
+            logits_flat[i : i + chunk_size], frm=frm, to=to
         )
-        if not hasattr(norm_layer, "remove_outliers"):
-            raise ValueError(
-                "InputNormalizationEncoderStep does not have a remove_outliers "
-                "attribute, this will break the TabPFN sklearn wrapper."
-            )
-        norm_layer.remove_outliers = (remove_outliers_std is not None) and (
-            remove_outliers_std > 0
-        )
-        if norm_layer.remove_outliers:
-            norm_layer.remove_outliers_sigma = remove_outliers_std
-
-        norm_layer.seed = seed
-        norm_layer.reset_seed()
-
-        if differentiable_input:
-            diffable_steps = []  # only differentiable encoder steps.
-            for module in model.y_encoder:
-                if isinstance(module, MulticlassClassificationTargetEncoderStep):
-                    pass
-                else:
-                    diffable_steps.append(module)
-
-            model.y_encoder = SequentialEncoder(*diffable_steps)
+    return out_flat.reshape(*batch_shape, num_buckets_to)
 
 
 def transform_borders_one(
@@ -490,9 +527,9 @@ def pad_tensors(
             tensors that are padded only along this dimension.
             If false, rows and feature dimensions are padded.
     """
-    max_size_clms = max([item.size(-1) for item in tensor_list])
+    max_size_clms = max(item.size(-1) for item in tensor_list)
     if not labels:
-        max_size_rows = max([item.size(-2) for item in tensor_list])
+        max_size_rows = max(item.size(-2) for item in tensor_list)
     ret_list = []
     for item in tensor_list:
         pad_seqence = [0, max_size_clms - item.size(-1)]
@@ -523,3 +560,26 @@ def balance_probas_by_class_counts(
         probas.device
     )
     return balanced_probas / balanced_probas.sum(dim=-1, keepdim=True)
+
+
+def convert_batch_of_cat_ix_to_schema(
+    batch_of_cat_indices: list[list[list[int]]],
+    num_features: int,
+) -> list[list[FeatureSchema]]:
+    """Convert a batch of categorical indices to a schema."""
+    feature_schema = []
+    for ibatch in batch_of_cat_indices:
+        feature_schema.append([])
+        for cat_indices in ibatch:
+            features = [
+                Feature(
+                    name=f"c{i}",
+                    modality=FeatureModality.CATEGORICAL
+                    if i in cat_indices
+                    else FeatureModality.NUMERICAL,
+                )
+                for i in range(num_features)
+            ]
+            feature_schema[-1].append(FeatureSchema(features=features))
+
+    return feature_schema
